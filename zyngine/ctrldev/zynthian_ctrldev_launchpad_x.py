@@ -25,24 +25,644 @@
 # ******************************************************************************
 
 import logging
+import time
 from time import sleep
+from copy import deepcopy
+from threading import Thread, RLock, Event
 
 # Zynthian specific modules
 from zynlibs.zynseq import zynseq
 from zyncoder.zyncore import lib_zyncore
+from zyngine.zynthian_signal_manager import zynsigman
 from zyngine.zynthian_chain_manager import MAX_NUM_MIDI_CHANS
-from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_zynpad
+from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_base, zynthian_ctrldev_zynpad
+from zyngine.ctrldev.zynthian_ctrldev_base_ui import ModeHandlerBase
 from zyngui import zynthian_gui_config
 
 # ------------------------------------------------------------------------------------------------------------------
 # Novation Launchpad X
 # ------------------------------------------------------------------------------------------------------------------
 
+# Driver modes
+MODE_LAUNCHER = "launcher"
+MODE_STEPSEQ = "stepseq"
 
+# Step sequencer screen layout. Remember the grid is vertically mirrored in this
+# driver (see get_note_xy below), so row 7 is the PHYSICAL TOP row.
+SS_ROW_INSTRUMENTS = 7    # Top row: instrument (note) pads
+SS_ROW_STEPS_A = 6        # Steps 1-8
+SS_ROW_STEPS_B = 5        # Steps 9-16
+SS_ROW_VELOCITY = 4       # Velocity brush pads
+SS_NUM_STEPS = 16
+SS_NUM_VELOCITIES = 5
+
+# Note-off happens before this many seconds elapse => plain toggle.
+# Above it => long press, which re-strikes the step at the current brush velocity.
+SS_LONG_PRESS_TIME = 0.5
+
+# Discrete velocity levels offered on the velocity lane, ordered LOW -> HIGH.
+# A selected level is applied to any step pad that is subsequently toggled on.
+SS_VELOCITY_VALUES = [25, 50, 75, 100, 127]
+SS_VELOCITY_DEFAULT = 2  # index into SS_VELOCITY_VALUES
+
+# Playhead polling interval (seconds). The zynseq play position is polled rather
+# than taken from a JACK MIDI clock tap so this driver has no hard jack/python-jack
+# dependency and no extra child process to manage.
+SS_PLAYHEAD_INTERVAL = 0.015
+
+
+class COLORS:
+    """Launchpad palette indices.
+
+    NOTE: Novation publishes the Launchpad X colour palette as an image, and the
+    brightness variants for each hue are not available as text. VELOCITY_STEP is a
+    provisional single-hue brightness ramp that MUST be eyeballed on real hardware
+    (see the plan's hardware checklist, item 6). It is deliberately isolated here
+    so it can be corrected by editing five numbers without touching any logic.
+    """
+
+    # Velocity ramp, LOW -> HIGH. Brighter == harder hit.
+    VELOCITY_STEP = [37, 33, 13, 9, 5]
+    # Dim marker for the first step of each beat, and for unused pads.
+    BEAT_MARKER = 1
+    OFF = 0
+    # Bright overlay for the step currently under the playhead.
+    PLAYHEAD = 3
+    # Instrument pads
+    INSTRUMENT = 79
+    INSTRUMENT_SELECTED = 3
+    # Velocity lane
+    VELOCITY_LANE = 37
+    VELOCITY_LANE_SELECTED = 3
+    # Transport buttons (right column)
+    TRANSPORT = 37
+    TRANSPORT_ACTIVE = 21
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Instrument pad storage. Inherits from dict to stay JSON-serializable.
+# ------------------------------------------------------------------------------------------------------------------
+class NotePad(dict):
+
+    def __init__(self, note, velocity=100, duration=1.0):
+        super().__init__(note=note, velocity=velocity, duration=duration)
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Marshalling of saved state (stored in the Zynthian snapshot)
+# ------------------------------------------------------------------------------------------------------------------
+class StepSeqState:
+
+    def __init__(self):
+        self._chains = {}
+        self._seqs = {}
+
+    def load(self, state):
+        state = deepcopy(state)
+        self._chains = state.get("chains", {})
+        for chain in self._chains.values():
+            chain["pads"] = {int(k): NotePad(**v) for k, v in chain.get("pads", {}).items()}
+            chain.setdefault("brush", SS_VELOCITY_DEFAULT)
+        for seq, value in state.get("seqs", {}).items():
+            self._seqs[int(seq)] = value
+
+    def save(self):
+        return {"seqs": self._seqs, "chains": self._chains}
+
+    def get_chain(self, chain_id):
+        key = str(chain_id) if chain_id is not None else "default"
+        chain = self._chains.get(key)
+        if chain is None:
+            chain = {"pads": {}, "brush": SS_VELOCITY_DEFAULT}
+            self._chains[key] = chain
+        return chain
+
+    def get_selection_by_sequence(self, seq):
+        return self._seqs.get(seq, [0, SS_VELOCITY_DEFAULT])
+
+    def set_selection_by_sequence(self, seq, pad, brush):
+        self._seqs[seq] = [pad, brush]
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Note player used to audition steps and velocity levels.
+#
+# Sends into zynseq's MIDI input so the sound comes out of the chain being
+# edited. Runs in its own thread so a long note does not block the MIDI handler.
+# ------------------------------------------------------------------------------------------------------------------
+class NotePlayer(Thread):
+
+    def __init__(self, libseq):
+        super().__init__()
+        self._libseq = libseq
+        self._ready = Event()
+        self._pending = []
+        self._lock = RLock()
+        self.daemon = True
+        self.start()
+
+    def play(self, note, velocity, duration=0.5, channel=0):
+        with self._lock:
+            self._pending = [(note, velocity, duration, channel)]
+        self._ready.set()
+
+    def end(self):
+        self.running = False
+        self._ready.set()
+
+    def _cycle_ms(self, cycles):
+        # 24 MIDI clock events per beat (quarter note)
+        bpm = self._libseq.getTempo()
+        return max(1, round(60 / bpm / 24 * 1000 * cycles))
+
+    def run(self):
+        self.running = True
+        while self.running:
+            self._ready.wait()
+            with self._lock:
+                if not self._pending:
+                    self._ready.clear()
+                    continue
+                note, velocity, duration, channel = self._pending.pop(0)
+            try:
+                self._send_note("on", note, channel, velocity)
+                time.sleep(self._cycle_ms(duration * 24) / 1000)
+                self._send_note("off", note, channel, 0)
+            except Exception as ex:
+                logging.error(f"Launchpad X note player error: {ex}")
+            with self._lock:
+                if not self._pending:
+                    self._ready.clear()
+
+    def _send_note(self, mode, note, channel, velocity=0):
+        status = 0x90 if mode == "on" else 0x80
+        status |= (channel & 0x0F)
+        self._libseq.sendMidiCommand(status, note & 0x7F, velocity & 0x7F)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Playhead monitor. Polls the sequence play position so the moving step can be
+# highlighted without requiring MIDI clock access.
+# ------------------------------------------------------------------------------------------------------------------
+class PlayheadMonitor(Thread):
+
+    def __init__(self, callback, interval=SS_PLAYHEAD_INTERVAL):
+        super().__init__()
+        self._callback = callback
+        self._interval = interval
+        self._enabled = False
+        self._lock = RLock()
+        self.daemon = True
+        self.start()
+
+    def set_enabled(self, enabled):
+        with self._lock:
+            self._enabled = enabled
+
+    def end(self):
+        self.running = False
+
+    def run(self):
+        self.running = True
+        while self.running:
+            try:
+                with self._lock:
+                    enabled = self._enabled
+                if enabled:
+                    self._callback()
+            except Exception as ex:
+                logging.error(f"Launchpad X playhead monitor error: {ex}")
+            time.sleep(self._interval)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# LED output with change tracking.
+#
+# The Launchpad X keeps a lighting canvas of 81 slots; sending a colour updates
+# it. Tracking the desired state locally lets the playhead overlay and restore
+# without clearing and repainting the whole surface on every tick.
+#
+# On the DAW interface the MIDI channel selects the lighting behaviour:
+#   channel 0 (0x90/0xB0) => static
+#   channel 1 (0x91/0xB1) => flashing
+#   channel 2 (0x92/0xB2) => pulsing
+# ------------------------------------------------------------------------------------------------------------------
+class FeedbackLEDs:
+
+    def __init__(self, driver):
+        self._driver = driver
+        self._pads = {}
+        self._ccs = {}
+        self._lock = RLock()
+
+    def pad_on(self, note, colour, channel=0):
+        with self._lock:
+            if self._pads.get(note) == (colour, channel):
+                return
+            self._pads[note] = (colour, channel)
+        self._driver.send_led_note(note, colour, channel)
+
+    def pad_off(self, note):
+        with self._lock:
+            if self._pads.get(note) == (COLORS.OFF, 0):
+                return
+            self._pads[note] = (COLORS.OFF, 0)
+        self._driver.send_led_note(note, COLORS.OFF, 0)
+
+    def cc_on(self, ccnum, colour, channel=0):
+        with self._lock:
+            if self._ccs.get(ccnum) == (colour, channel):
+                return
+            self._ccs[ccnum] = (colour, channel)
+        self._driver.send_led_cc(ccnum, colour, channel)
+
+    def cc_off(self, ccnum):
+        self.cc_on(ccnum, COLORS.OFF, 0)
+
+    def all_off(self):
+        with self._lock:
+            pads, ccs = list(self._pads), list(self._ccs)
+            self._pads.clear()
+            self._ccs.clear()
+        for note in pads:
+            self._driver.send_led_note(note, COLORS.OFF, 0)
+        for ccnum in ccs:
+            self._driver.send_led_cc(ccnum, COLORS.OFF, 0)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Step sequencer mode handler
+# ------------------------------------------------------------------------------------------------------------------
+class StepSeqHandler(ModeHandlerBase):
+
+    def __init__(self, state_manager, driver, idev_in):
+        super().__init__(state_manager)
+        self._driver = driver
+        self._own_device_id = idev_in
+        self._libseq = self._zynseq.libseq
+        self._leds = FeedbackLEDs(driver)
+        self._saved_state = StepSeqState()
+        self._note_player = NotePlayer(self._libseq)
+        self._playhead = PlayheadMonitor(self._update_playhead)
+
+        self._selected_seq = (0, 0)
+        self._selected_note_pad = 0
+        self._brush = SS_VELOCITY_DEFAULT
+        self._note_pads = {}
+        self._chain_id = None
+
+        self._pressed_steps = {}
+        self._held_instrument = None
+        self._playhead_step = None
+        self._is_playing = False
+
+    def end(self):
+        self._playhead.end()
+        self._playhead.set_enabled(False)
+        self._note_player.end()
+
+    def set_active(self, active):
+        super().set_active(active)
+        if active:
+            self._load_current_selection()
+            self._playhead.set_enabled(True)
+            self.refresh()
+        else:
+            self._playhead.set_enabled(False)
+            self._leds.all_off()
+
+    # ----- state ---------------------------------------------------------
+
+    def get_state(self):
+        return {"stepseq": self._saved_state.save()}
+
+    def set_state(self, state):
+        state = state.get("stepseq")
+        if state is not None:
+            self._saved_state.load(state)
+
+    def _load_current_selection(self):
+        """Bind to whatever the Zynthian screen currently has selected."""
+        try:
+            seq = (self._zynseq.phrase, self._zynseq.chan)
+        except Exception:
+            seq = (0, 0)
+        self._select_sequence(*seq)
+
+    def _select_sequence(self, phrase, chan):
+        self._selected_seq = (phrase, chan)
+        self._chain_id = self._get_chain_id_by_sequence(phrase, chan)
+        chain = self._saved_state.get_chain(self._chain_id)
+        self._note_pads = chain["pads"]
+        pad, brush = self._saved_state.get_selection_by_sequence(phrase * 256 + chan)
+        self._selected_note_pad = pad if 0 <= pad < 8 else 0
+        self._brush = brush if 0 <= brush < SS_NUM_VELOCITIES else SS_VELOCITY_DEFAULT
+
+    def _save_selection(self):
+        self._saved_state.get_chain(self._chain_id)["brush"] = self._brush
+        self._saved_state.set_selection_by_sequence(
+            self._selected_seq[0] * 256 + self._selected_seq[1],
+            self._selected_note_pad, self._brush)
+
+    @property
+    def _selected_note(self):
+        return self._note_pads.get(self._selected_note_pad)
+
+    @property
+    def _brush_velocity(self):
+        return SS_VELOCITY_VALUES[self._brush]
+
+    # ----- geometry ------------------------------------------------------
+
+    def _instrument_pad(self, index):
+        return self._driver.get_note_from_xy(index, SS_ROW_INSTRUMENTS)
+
+    def _velocity_pad(self, index):
+        return self._driver.get_note_from_xy(index, SS_ROW_VELOCITY)
+
+    def _step_pad(self, step):
+        row = SS_ROW_STEPS_A if step < 8 else SS_ROW_STEPS_B
+        return self._driver.get_note_from_xy(step % 8, row)
+
+    def _note_to_step(self, note):
+        col, row = self._driver.get_note_xy(note)
+        if row == SS_ROW_STEPS_A:
+            return col
+        if row == SS_ROW_STEPS_B:
+            return 8 + col
+        return None
+
+    def _steps_in_pattern(self):
+        return min(SS_NUM_STEPS, self._libseq.getSteps())
+
+    # ----- input ---------------------------------------------------------
+
+    def note_on(self, note, velocity, shifted_override=None):
+        col, row = self._driver.get_note_xy(note)
+
+        if row == SS_ROW_INSTRUMENTS and col < 8:
+            self._held_instrument = col
+            self._select_instrument(col)
+            return True
+
+        if row == SS_ROW_VELOCITY and col < SS_NUM_VELOCITIES:
+            self._set_brush(col)
+            return True
+
+        step = self._note_to_step(note)
+        if step is not None and step < self._steps_in_pattern():
+            self._pressed_steps[step] = time.time()
+            return True
+
+        return False
+
+    def note_off(self, note, shifted_override=None):
+        col, row = self._driver.get_note_xy(note)
+
+        if row == SS_ROW_INSTRUMENTS and col < 8:
+            self._held_instrument = None
+            self._disable_midi_listening()
+            return True
+
+        step = self._note_to_step(note)
+        if step is not None:
+            pressed_at = self._pressed_steps.pop(step, None)
+            if pressed_at is not None and step < self._steps_in_pattern():
+                if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
+                    self._restrike_step(step)
+                else:
+                    self._toggle_step(step)
+            return True
+
+        return False
+
+    def cc_change(self, ccnum, ccval):
+        if ccval <= 0:
+            return True
+        # Arrow cluster: Up leaves the step sequencer (the screen change flips the
+        # driver back to launcher mode). Left/Right move the instrument selection.
+        if ccnum == 0x5B:
+            self._state_manager.send_cuia("BACK")
+            return True
+        if ccnum == 0x5D:
+            self._select_instrument((self._selected_note_pad - 1) % 8)
+            return True
+        if ccnum == 0x5E:
+            self._select_instrument((self._selected_note_pad + 1) % 8)
+            return True
+        # Right column, top button toggles playback.
+        col, row = self._driver.get_note_xy(ccnum)
+        if col == 8 and row == 0:
+            self._toggle_play()
+        return True
+
+    def _select_instrument(self, index):
+        self._selected_note_pad = index
+        self._enable_midi_listening()
+        note_pad = self._selected_note
+        if note_pad is not None:
+            self._note_player.play(
+                note_pad["note"], self._brush_velocity,
+                note_pad["duration"], self._chain_midi_chan())
+        self._save_selection()
+        self.refresh()
+
+    def _set_brush(self, level):
+        self._brush = level
+        note_pad = self._selected_note
+        if note_pad is not None:
+            self._note_player.play(
+                note_pad["note"], self._brush_velocity,
+                note_pad["duration"], self._chain_midi_chan())
+        self._save_selection()
+        self.refresh()
+
+    # ----- sequencer operations -----------------------------------------
+
+    def _toggle_step(self, step):
+        note_pad = self._selected_note
+        if note_pad is None:
+            return
+        note = note_pad["note"]
+        if self._libseq.getNoteStart(step, note) == -1:
+            self._libseq.addNote(
+                step, note, self._brush_velocity, note_pad["duration"], 0)
+            self._note_player.play(
+                note, self._brush_velocity, note_pad["duration"],
+                self._chain_midi_chan())
+        else:
+            self._libseq.removeNote(step, note)
+        self._render_steps()
+
+    def _restrike_step(self, step):
+        note_pad = self._selected_note
+        if note_pad is None:
+            return
+        note = note_pad["note"]
+        if self._libseq.getNoteStart(step, note) == -1:
+            return
+        velocity = self._brush_velocity
+        self._libseq.setNoteVelocity(step, note, velocity)
+        self._note_player.play(
+            note, velocity, note_pad["duration"], self._chain_midi_chan())
+        self._render_steps()
+
+    def _toggle_play(self):
+        self._libseq.togglePlayState(
+            self._zynseq.scene, self._selected_seq[0], self._selected_seq[1])
+
+    def _chain_midi_chan(self):
+        try:
+            return self._libseq.getChannel(
+                self._zynseq.scene, self._selected_seq[0], self._selected_seq[1], 0)
+        except Exception:
+            return 0
+
+    def _is_sequence_playing(self):
+        return self._libseq.getPlayState(
+            self._zynseq.scene, self._selected_seq[0], self._selected_seq[1]) != zynseq.SEQ_STOPPED
+
+    # ----- MIDI learn ----------------------------------------------------
+
+    def _enable_midi_listening(self):
+        zynsigman.register(zynsigman.S_MIDI, zynsigman.SS_MIDI_NOTE_ON, self._on_midi_note_on)
+
+    def _disable_midi_listening(self):
+        zynsigman.unregister(zynsigman.S_MIDI, zynsigman.SS_MIDI_NOTE_ON, self._on_midi_note_on)
+
+    def _on_midi_note_on(self, izmip, chan, note, vel):
+        # Capture a note played on another device while an instrument pad is held.
+        if self._held_instrument is None or izmip == self._own_device_id:
+            return
+        if izmip >= self._state_manager.get_zmip_seq_index():
+            return
+        self._note_pads[self._held_instrument] = NotePad(note, vel, 1.0)
+        self._select_instrument(self._held_instrument)
+
+    # ----- external state ------------------------------------------------
+
+    def update_seq_state(self, phrase, chan, state=None, mode=None, group=None):
+        if state is not None:
+            self._is_playing = state != zynseq.SEQ_STOPPED
+
+    def on_screen_change(self, screen):
+        self._current_screen = screen
+
+    # ----- rendering -----------------------------------------------------
+
+    def refresh(self):
+        self.control_off()
+        self._render_instruments()
+        self._render_velocity_lane()
+        self._render_steps()
+        self._render_transport()
+
+    def control_off(self):
+        for ccnum in (89, 79, 69, 59, 49, 39, 29, 19):
+            self._leds.cc_off(ccnum)
+        for arrow in (0x5B, 0x5C, 0x5D, 0x5E):
+            self._leds.cc_off(arrow)
+
+    def _render_instruments(self):
+        for index in range(8):
+            note = self._instrument_pad(index)
+            if index == self._selected_note_pad:
+                self._leds.pad_on(note, COLORS.INSTRUMENT_SELECTED, 2)
+            elif index in self._note_pads:
+                self._leds.pad_on(note, COLORS.INSTRUMENT)
+            else:
+                self._leds.pad_off(note)
+
+    def _render_velocity_lane(self):
+        for index in range(SS_NUM_VELOCITIES):
+            note = self._velocity_pad(index)
+            if index == self._brush:
+                self._leds.pad_on(note, COLORS.VELOCITY_LANE_SELECTED, 2)
+            else:
+                self._leds.pad_off(note)
+
+    def _step_velocity_level(self, step, note):
+        """Map a stored step velocity back onto the nearest lane level."""
+        velocity = self._libseq.getNoteVelocity(step, note)
+        best, best_delta = 0, None
+        for level, value in enumerate(SS_VELOCITY_VALUES):
+            delta = abs(value - velocity)
+            if best_delta is None or delta < best_delta:
+                best, best_delta = level, delta
+        return best
+
+    def _render_steps(self):
+        note_pad = self._selected_note
+        used = self._steps_in_pattern()
+        for step in range(SS_NUM_STEPS):
+            note = self._step_pad(step)
+            if step >= used:
+                self._leds.pad_off(note)
+                continue
+            # The playhead wins over everything, including empty steps, so the
+            # current position stays visible even with sparse patterns.
+            if step == self._playhead_step:
+                self._leds.pad_on(note, COLORS.PLAYHEAD, 2)
+                continue
+            if note_pad is None or self._libseq.getNoteStart(step, note_pad["note"]) == -1:
+                if step % 4 == 0:
+                    self._leds.pad_on(note, COLORS.BEAT_MARKER)
+                else:
+                    self._leds.pad_off(note)
+                continue
+            level = self._step_velocity_level(step, note_pad["note"])
+            self._leds.pad_on(note, COLORS.VELOCITY_STEP[level])
+
+    def _render_transport(self):
+        colour = COLORS.TRANSPORT_ACTIVE if self._is_playing else COLORS.TRANSPORT
+        self._leds.cc_on(89, colour, 2 if self._is_playing else 0)
+
+    def _update_playhead(self):
+        """Called from the playhead monitor thread."""
+        try:
+            if self._libseq.getPlayState(
+                    self._zynseq.scene,
+                    self._selected_seq[0],
+                    self._selected_seq[1]) == zynseq.SEQ_STOPPED:
+                new_step = None
+            else:
+                clocks_per_step = self._libseq.getClocksPerStep()
+                if clocks_per_step <= 0:
+                    new_step = None
+                else:
+                    position = self._libseq.getSequencePlayPosition(
+                        self._zynseq.scene,
+                        self._selected_seq[0],
+                        self._selected_seq[1])
+                    index = int(position) // clocks_per_step
+                    new_step = index if index < self._steps_in_pattern() else None
+            if new_step != self._playhead_step:
+                self._playhead_step = new_step
+                self._render_steps()
+        except Exception as ex:
+            logging.error(f"Launchpad X playhead update error: {ex}")
+
+
+# ------------------------------------------------------------------------------------------------------------------
 class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
 
     dev_ids = ["Launchpad X IN 1"]
-    driver_description = "Launcher + arrow keys integration"
+    driver_name = "Launchpad X"
+    driver_description = "Launcher + arrow keys + step sequencer"
+
+    def __init__(self, state_manager, idev_in, idev_out=None):
+        super().__init__(state_manager, idev_in, idev_out)
+        self._mode = MODE_LAUNCHER
+        self._stepseq = None
 
     def send_sysex(self, data):
         if self.idev_out is not None:
@@ -55,6 +675,21 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         col = (note % 10) - 1
         return col, row
 
+    def get_note_from_xy(self, col, row):
+        return 10 * (8 - row) + col + 1
+
+    # ----- LED output --------------------------------------------------
+
+    def send_led_note(self, note, colour, channel=0):
+        if self.idev_out is not None:
+            lib_zyncore.dev_send_note_on(self.idev_out, channel, note, colour)
+
+    def send_led_cc(self, ccnum, colour, channel=0):
+        if self.idev_out is not None:
+            lib_zyncore.dev_send_ccontrol_change(self.idev_out, channel, ccnum, colour)
+
+    # ----- lifecycle ----------------------------------------------------
+
     def init(self):
         # Awake
         self.sleep_off()
@@ -63,16 +698,76 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         self.send_sysex("10 01")
         # Select session layout (session = 0x00, faders = 0x0D)
         self.send_sysex("00 00")
+        self._stepseq = StepSeqHandler(self.state_manager, self, self.idev)
         super().init()
+        zynsigman.register(zynsigman.S_GUI, zynsigman.SS_GUI_SHOW_SCREEN, self._on_gui_show_screen)
 
     def end(self):
+        if self._stepseq is not None:
+            self._stepseq.end()
+        zynsigman.unregister(zynsigman.S_GUI, zynsigman.SS_GUI_SHOW_SCREEN, self._on_gui_show_screen)
         super().end()
         # Exit DAW session mode
         self.send_sysex("10 00")
         # Select Keys layout (drums = 0x04, keys = 0x05, user = 0x06, prog = 0x7F)
         self.send_sysex("00 05")
 
+    # ----- mode switching -------------------------------------------------
+
+    def _on_gui_show_screen(self, screen):
+        """The on-screen Pattern Editor is the single source of truth for the mode."""
+        if screen == "pattern_editor":
+            self.set_mode(MODE_STEPSEQ)
+        elif self._mode == MODE_STEPSEQ:
+            self.set_mode(MODE_LAUNCHER)
+
+    def set_mode(self, mode):
+        if mode == self._mode:
+            return
+        self._mode = mode
+        if mode == MODE_STEPSEQ:
+            self._stepseq.set_active(True)
+        else:
+            self._stepseq.set_active(False)
+            # The handler cleared its own LEDs; wipe the device state and repaint
+            # the launcher, otherwise the grid would stay dark until the next event.
+            self.light_off()
+            self.refresh()
+
+    def get_mode(self):
+        return self._mode
+
+    def get_state(self):
+        state = super().get_state()
+        state["mode"] = self._mode
+        if self._stepseq is not None:
+            state["stepseq"] = self._stepseq.get_state()
+        return state
+
+    def set_state(self, state):
+        super().set_state(state)
+        if self._stepseq is not None and "stepseq" in state:
+            self._stepseq.set_state(state)
+
+    # ----- signal routing -------------------------------------------------
+
+    def refresh(self):
+        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+            # Only the base refresh (chain list); skip the launcher repaint.
+            zynthian_ctrldev_base.refresh(self)
+            self._stepseq.refresh()
+            return
+        super().refresh()
+
+    def update_seq_state(self, phrase, chan):
+        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+            self._stepseq.update_seq_state(phrase, chan)
+            return
+        super().update_seq_state(phrase, chan)
+
     def update_pad(self, row, col, pad_info):
+        if self._mode == MODE_STEPSEQ:
+            return
         midi_chan = 0
         color = 0
         try:
@@ -117,9 +812,17 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             ccnum = 89 - 10 * row
             lib_zyncore.dev_send_ccontrol_change(self.idev_out, 0, ccnum, 0)
 
+    # ----- MIDI input ------------------------------------------------------
+
     def midi_event(self, ev):
         # logging.debug(f"Launchpad X MIDI handler => {ev}")
         evtype = (ev[0] >> 4) & 0x0F
+        # SysEx
+        if ev[0] == 0xF0:
+            logging.info(f"Received SysEx => {ev.hex(' ')}")
+            return True
+        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+            return self._stepseq_midi_event(ev, evtype)
         # Note ON => launch/stop sequence
         if evtype == 0x9:
             note = ev[1] & 0x7F
@@ -156,10 +859,27 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
                         except:
                             pass
             return True
-        # SysEx
-        elif ev[0] == 0xF0:
-            logging.info(f"Received SysEx => {ev.hex(' ')}")
+
+    def _stepseq_midi_event(self, ev, evtype):
+        """Route input to the step sequencer handler."""
+        handler = self._stepseq
+        if evtype == 0x9:
+            note = ev[1] & 0x7F
+            vel = ev[2] & 0x7F
+            if vel > 0:
+                handler.note_on(note, vel)
+            else:
+                handler.note_off(note)
             return True
+        elif evtype == 0xB:
+            handler.cc_change(ev[1] & 0x7F, ev[2] & 0x7F)
+            return True
+        elif evtype == 0x8:
+            handler.note_off(ev[1] & 0x7F)
+            return True
+        return True
+
+    # ----- device state ----------------------------------------------------
 
     # Light-Off LEDs
     def light_off(self):
@@ -172,7 +892,7 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         # Sleep Mode (0 = sleep, 1 = awake)
         self.send_sysex("09 00")
 
-    # Sleep On
+    # Sleep Off
     def sleep_off(self):
         # Sleep Mode (0 = sleep, 1 = awake)
         self.send_sysex("09 01")
