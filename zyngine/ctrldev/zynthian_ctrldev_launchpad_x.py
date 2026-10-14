@@ -47,6 +47,15 @@ from zyngui import zynthian_gui_config
 MODE_LAUNCHER = "launcher"
 MODE_STEPSEQ = "stepseq"
 
+# Top-row buttons, measured on hardware in Session layout:
+#   91-94 arrows, 95 Session/Mixer, 96 Note, 97 Custom, 98 Capture MIDI.
+# The arrows are already handled in the CC branch. These three switch the
+# device to a layout this driver does not paint for.
+CC_SESSION = 95
+CC_NOTE = 96
+CC_CUSTOM = 97
+LAYOUT_BUTTON_CCS = (CC_SESSION, CC_NOTE, CC_CUSTOM)
+
 # Step sequencer screen layout.
 #
 # Row indices here are DRIVER rows, which run opposite to physical rows.
@@ -827,12 +836,33 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
 
     # ----- MIDI input ------------------------------------------------------
 
+    def _restore_session_layout(self):
+        """Undo a user-initiated layout change.
+
+        Novation documents that the Session/Note/Custom buttons "still send the
+        corresponding CC messages on interaction, allowing the DAW to catch
+        relevant events". So the device really does switch layout even in DAW
+        mode, and this driver really was painting Session-layout note numbers
+        into a Note or Custom layout - which scrambles the grid and turns pad
+        presses into sequence launches. Force Session back and repaint.
+        """
+        if self.idev_out is None:
+            return
+        self.send_sysex("00 00")
+        self.refresh()
+
     def midi_event(self, ev):
         # logging.debug(f"Launchpad X MIDI handler => {ev}")
         evtype = (ev[0] >> 4) & 0x0F
         # SysEx
         if ev[0] == 0xF0:
             logging.info(f"Received SysEx => {ev.hex(' ')}")
+            return True
+        # Layout buttons, caught before mode dispatch so they are handled in
+        # launcher mode and stepseq mode alike.
+        if evtype == 0xB and (ev[2] & 0x7F) > 0 and (ev[1] & 0x7F) in LAYOUT_BUTTON_CCS:
+            logging.debug("Layout button pressed - restoring Session layout")
+            self._restore_session_layout()
             return True
         if self._mode == MODE_STEPSEQ and self._stepseq is not None:
             return self._stepseq_midi_event(ev, evtype)
