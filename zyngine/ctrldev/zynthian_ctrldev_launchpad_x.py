@@ -74,6 +74,12 @@ SS_ROW_VELOCITY = 3       # Velocity brush pads
 SS_NUM_STEPS = 16
 SS_NUM_VELOCITIES = 5
 
+# Safety valve for the instrument scan. libseq offers no way to list the notes a
+# pattern holds, so the notes are discovered by probing getNoteStart() over the
+# whole grid: up to 128 notes x this many steps. Only ever run on entering the
+# mode or when the pattern changes, never on a repaint.
+SS_SCAN_MAX_STEPS = 256
+
 # Note-off happens before this many seconds elapse => plain toggle.
 # Above it => long press, which re-strikes the step at the current brush velocity.
 SS_LONG_PRESS_TIME = 0.5
@@ -113,6 +119,9 @@ class COLORS:
     # Instrument pads
     INSTRUMENT = 21
     INSTRUMENT_SELECTED = 3
+    # Instrument slot with no note behind it. Same hue as INSTRUMENT but dim, so
+    # an unconfigured grid reads as "nothing here yet" instead of looking ready.
+    INSTRUMENT_EMPTY = 23
     # Velocity lane
     VELOCITY_LANE = 18
     VELOCITY_LANE_SELECTED = 3
@@ -340,6 +349,10 @@ class StepSeqHandler(ModeHandlerBase):
         self._selected_note_pad = 0
         self._brush = SS_VELOCITY_DEFAULT
         self._note_pads = {}
+        # Notes read out of the pattern itself, ascending. Transient: this is
+        # rebuilt from the sequencer and deliberately never saved to the
+        # snapshot, so a stale list can never outlive the pattern it came from.
+        self._derived_notes = []
         self._chain_id = None
 
         self._pressed_steps = {}
@@ -388,6 +401,9 @@ class StepSeqHandler(ModeHandlerBase):
         pad, brush = self._saved_state.get_selection_by_sequence(phrase * 256 + chan)
         self._selected_note_pad = pad if 0 <= pad < 8 else 0
         self._brush = brush if 0 <= brush < SS_NUM_VELOCITIES else SS_VELOCITY_DEFAULT
+        # The pattern is the default source of instruments, so it has to be read
+        # whenever the sequence being edited changes.
+        self.rescan_instruments()
 
     def _save_selection(self):
         self._saved_state.get_chain(self._chain_id)["brush"] = self._brush
@@ -397,7 +413,22 @@ class StepSeqHandler(ModeHandlerBase):
 
     @property
     def _selected_note(self):
-        return self._note_pads.get(self._selected_note_pad)
+        return self._note_pad_at(self._selected_note_pad)
+
+    def _note_pad_at(self, index):
+        """The note behind an instrument slot, or None when the slot is empty.
+
+        A MIDI-learned pad always wins. Otherwise the slot falls back to the
+        notes read out of the pattern, which is what makes an untouched pattern
+        editable without any prior MIDI learn. Callers must treat None as "no
+        instrument selected" rather than as note 0.
+        """
+        pad = self._note_pads.get(index)
+        if pad is not None:
+            return pad
+        if 0 <= index < len(self._derived_notes):
+            return NotePad(self._derived_notes[index])
+        return None
 
     @property
     def _brush_velocity(self):
@@ -425,6 +456,47 @@ class StepSeqHandler(ModeHandlerBase):
 
     def _steps_in_pattern(self):
         return min(SS_NUM_STEPS, self._libseq.getSteps())
+
+    def _scan_pattern_notes(self):
+        """Distinct notes held by the current pattern, ascending.
+
+        libseq exposes no "list the notes" call, so the notes are discovered by
+        probing getNoteStart() across the grid. The loop is note-major so that a
+        note which hits early exits its step loop immediately, which keeps the
+        common case (a handful of instruments across a short pattern) cheap.
+        Bounded by SS_SCAN_MAX_STEPS; a pattern longer than that is scanned only
+        in part, and the truncation is logged rather than hidden.
+        """
+        notes = []
+        try:
+            steps = self._libseq.getSteps()
+            if isinstance(steps, int) and steps > 0:
+                if steps > SS_SCAN_MAX_STEPS:
+                    logging.warning(
+                        f"Launchpad X instrument scan truncated to {SS_SCAN_MAX_STEPS} of {steps} steps")
+                    steps = SS_SCAN_MAX_STEPS
+                for note in range(128):
+                    for step in range(steps):
+                        if self._libseq.getNoteStart(step, note) != -1:
+                            notes.append(note)
+                            break
+        except Exception as ex:
+            logging.error(f"Launchpad X instrument scan failed: {ex}")
+        return notes
+
+    def rescan_instruments(self):
+        """Rebuild the instrument row from the current pattern."""
+        self._derived_notes = self._scan_pattern_notes()
+        logging.debug(f"Launchpad X instrument scan -> {len(self._derived_notes)} notes")
+        # A selection still pointing at a now-empty slot would silently do
+        # nothing on a step press, which is precisely the failure this seeding
+        # exists to remove. Fall back to the first slot that actually has a note.
+        if self._note_pad_at(self._selected_note_pad) is None:
+            for index in range(8):
+                if self._note_pad_at(index) is not None:
+                    self._selected_note_pad = index
+                    break
+        return self._derived_notes
 
     # ----- input ---------------------------------------------------------
 
@@ -599,10 +671,13 @@ class StepSeqHandler(ModeHandlerBase):
             note = self._instrument_pad(index)
             if index == self._selected_note_pad:
                 self._leds.pad_on(note, COLORS.INSTRUMENT_SELECTED, 2)
-            elif index in self._note_pads:
+            elif self._note_pad_at(index) is not None:
                 self._leds.pad_on(note, COLORS.INSTRUMENT)
             else:
-                self._leds.pad_off(note)
+                # Dim rather than off. An empty slot is information the player
+                # needs, and a black pad is indistinguishable from a grid that
+                # was never painted.
+                self._leds.pad_on(note, COLORS.INSTRUMENT_EMPTY)
 
     def _render_velocity_lane(self):
         for index in range(SS_NUM_VELOCITIES):
@@ -739,7 +814,15 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
     def _on_gui_show_screen(self, screen):
         """The on-screen Pattern Editor is the single source of truth for the mode."""
         if screen == "pattern_editor":
-            self.set_mode(MODE_STEPSEQ)
+            if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+                # Already in stepseq mode, so set_mode() returns early. The player
+                # can switch patterns without ever leaving the Pattern Editor, so
+                # refresh the instruments explicitly rather than showing the
+                # previous pattern's.
+                self._stepseq.rescan_instruments()
+                self._stepseq.refresh()
+            else:
+                self.set_mode(MODE_STEPSEQ)
         elif self._mode == MODE_STEPSEQ:
             self.set_mode(MODE_LAUNCHER)
 
