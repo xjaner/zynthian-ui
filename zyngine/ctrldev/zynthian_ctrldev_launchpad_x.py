@@ -47,12 +47,21 @@ from zyngui import zynthian_gui_config
 MODE_LAUNCHER = "launcher"
 MODE_STEPSEQ = "stepseq"
 
-# Step sequencer screen layout. Remember the grid is vertically mirrored in this
-# driver (see get_note_xy below), so row 7 is the PHYSICAL TOP row.
-SS_ROW_INSTRUMENTS = 7    # Top row: instrument (note) pads
-SS_ROW_STEPS_A = 6        # Steps 1-8
-SS_ROW_STEPS_B = 5        # Steps 9-16
-SS_ROW_VELOCITY = 4       # Velocity brush pads
+# Step sequencer screen layout.
+#
+# Row indices here are DRIVER rows, which run opposite to physical rows.
+# get_note_from_xy() maps note = 10 * (8 - row) + col + 1, therefore:
+#
+#     row 0 -> notes 81-88 -> the PHYSICAL TOP row
+#     row 7 -> notes 11-18 -> the PHYSICAL BOTTOM row
+#
+# Verified on hardware: sending notes 11-18 lights the bottom row and
+# notes 81-88 lights the top row. These constants are therefore counted
+# from the physical top, which means LOW driver row numbers.
+SS_ROW_INSTRUMENTS = 0    # Physical top: instrument (note) pads
+SS_ROW_STEPS_A = 1        # Steps 1-8
+SS_ROW_STEPS_B = 2        # Steps 9-16
+SS_ROW_VELOCITY = 3       # Velocity brush pads
 SS_NUM_STEPS = 16
 SS_NUM_VELOCITIES = 5
 
@@ -72,27 +81,31 @@ SS_PLAYHEAD_INTERVAL = 0.015
 
 
 class COLORS:
-    """Launchpad palette indices.
+    """Launchpad X palette indices, measured on hardware.
 
-    NOTE: Novation publishes the Launchpad X colour palette as an image, and the
-    brightness variants for each hue are not available as text. VELOCITY_STEP is a
-    provisional single-hue brightness ramp that MUST be eyeballed on real hardware
-    (see the plan's hardware checklist, item 6). It is deliberately isolated here
-    so it can be corrected by editing five numbers without touching any logic.
+    The palette is organised in groups of four per hue:
+        X+0 = the secondary variant, X+1 = full, X+2 = half, X+3 = dim
+    Verified by sweeping all 128 velocity values across the grid, e.g.
+    5/6/7 red full/half/dim, 9/10/11 orange, 13/14/15 yellow, 17/18/19 green.
+
+    Consequence: there are only THREE usable brightness levels per hue, not five.
+    A five-step velocity ramp therefore has to combine brightness and hue into a
+    heat scale, which is what VELOCITY_STEP does.
     """
 
-    # Velocity ramp, LOW -> HIGH. Brighter == harder hit.
-    VELOCITY_STEP = [37, 33, 13, 9, 5]
+    # Velocity ramp, SOFT -> MAX. Monotonic in perceived intensity.
+    #   19 dim green, 18 half green, 17 full green, 13 full yellow, 3 white
+    VELOCITY_STEP = [19, 18, 17, 13, 3]
     # Dim marker for the first step of each beat, and for unused pads.
     BEAT_MARKER = 1
     OFF = 0
     # Bright overlay for the step currently under the playhead.
     PLAYHEAD = 3
     # Instrument pads
-    INSTRUMENT = 79
+    INSTRUMENT = 21
     INSTRUMENT_SELECTED = 3
     # Velocity lane
-    VELOCITY_LANE = 37
+    VELOCITY_LANE = 18
     VELOCITY_LANE_SELECTED = 3
     # Transport buttons (right column)
     TRANSPORT = 37
