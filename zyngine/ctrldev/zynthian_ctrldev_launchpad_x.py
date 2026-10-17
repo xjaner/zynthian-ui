@@ -55,6 +55,9 @@ CC_SESSION = 95
 CC_NOTE = 96
 CC_CUSTOM = 97
 LAYOUT_BUTTON_CCS = (CC_SESSION, CC_NOTE, CC_CUSTOM)
+# Capture MIDI. Not a layout button, so it is not caught by the guard above.
+# In stepseq mode it is BACK - the up arrow is needed for step paging.
+CC_CAPTURE = 98
 
 # Step sequencer screen layout.
 #
@@ -356,6 +359,9 @@ class StepSeqHandler(ModeHandlerBase):
         self._chain_id = None
 
         self._pressed_steps = {}
+        # Absolute step shown at the left edge of the step window. The window is
+        # never moved by the playhead - only by the player pressing Up/Down.
+        self._step_offset = 0
         self._held_instrument = None
         self._playhead_step = None
         self._is_playing = False
@@ -403,6 +409,7 @@ class StepSeqHandler(ModeHandlerBase):
         self._brush = brush if 0 <= brush < SS_NUM_VELOCITIES else SS_VELOCITY_DEFAULT
         # The pattern is the default source of instruments, so it has to be read
         # whenever the sequence being edited changes.
+        self._step_offset = 0
         self.rescan_instruments()
 
     def _save_selection(self):
@@ -442,11 +449,13 @@ class StepSeqHandler(ModeHandlerBase):
     def _velocity_pad(self, index):
         return self._driver.get_note_from_xy(index, SS_ROW_VELOCITY)
 
-    def _step_pad(self, step):
-        row = SS_ROW_STEPS_A if step < 8 else SS_ROW_STEPS_B
-        return self._driver.get_note_from_xy(step % 8, row)
+    def _step_pad(self, index):
+        """Pad for a window-relative step, 0-15."""
+        row = SS_ROW_STEPS_A if index < 8 else SS_ROW_STEPS_B
+        return self._driver.get_note_from_xy(index % 8, row)
 
     def _note_to_step(self, note):
+        """Window-relative step for a pad note, or None if it is not a step pad."""
         col, row = self._driver.get_note_xy(note)
         if row == SS_ROW_STEPS_A:
             return col
@@ -454,8 +463,28 @@ class StepSeqHandler(ModeHandlerBase):
             return 8 + col
         return None
 
-    def _steps_in_pattern(self):
-        return min(SS_NUM_STEPS, self._libseq.getSteps())
+    def _pattern_length(self):
+        """Total steps in the pattern, uncapped. 0 when the pattern is empty."""
+        try:
+            return max(0, self._libseq.getSteps())
+        except Exception:
+            return 0
+
+    def _max_step_offset(self):
+        """Highest window offset that still shows content, snapped to a page."""
+        length = self._pattern_length()
+        if length <= SS_NUM_STEPS:
+            return 0
+        return ((length - 1) // SS_NUM_STEPS) * SS_NUM_STEPS
+
+    def _clamp_step_page(self):
+        """Keep the window inside the pattern, e.g. after the pattern shortened."""
+        self._step_offset = max(0, min(self._step_offset, self._max_step_offset()))
+
+    def _set_step_page(self, offset):
+        """Move the step window. Clamped, so the arrows are safe to mash."""
+        self._step_offset = max(0, min(offset, self._max_step_offset()))
+        self._render_steps()
 
     def _scan_pattern_notes(self):
         """Distinct notes held by the current pattern, ascending.
@@ -496,6 +525,8 @@ class StepSeqHandler(ModeHandlerBase):
                 if self._note_pad_at(index) is not None:
                     self._selected_note_pad = index
                     break
+        # The pattern may have been replaced by a shorter one.
+        self._clamp_step_page()
         return self._derived_notes
 
     # ----- input ---------------------------------------------------------
@@ -512,10 +543,14 @@ class StepSeqHandler(ModeHandlerBase):
             self._set_brush(col)
             return True
 
-        step = self._note_to_step(note)
-        if step is not None and step < self._steps_in_pattern():
-            self._pressed_steps[step] = time.time()
-            return True
+        index = self._note_to_step(note)
+        if index is not None:
+            # Keyed by ABSOLUTE step, so changing page while a pad is held
+            # cannot make one pad's release land on another.
+            step = self._step_offset + index
+            if step < self._pattern_length():
+                self._pressed_steps[step] = time.time()
+                return True
 
         return False
 
@@ -527,10 +562,11 @@ class StepSeqHandler(ModeHandlerBase):
             self._disable_midi_listening()
             return True
 
-        step = self._note_to_step(note)
-        if step is not None:
+        index = self._note_to_step(note)
+        if index is not None:
+            step = self._step_offset + index
             pressed_at = self._pressed_steps.pop(step, None)
-            if pressed_at is not None and step < self._steps_in_pattern():
+            if pressed_at is not None and step < self._pattern_length():
                 if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
                     self._restrike_step(step)
                 else:
@@ -542,9 +578,17 @@ class StepSeqHandler(ModeHandlerBase):
     def cc_change(self, ccnum, ccval):
         if ccval <= 0:
             return True
-        # Arrow cluster: Up leaves the step sequencer (the screen change flips the
-        # driver back to launcher mode). Left/Right move the instrument selection.
+        # Arrow cluster: Up/Down move the 16-step window, Left/Right move the
+        # instrument selection. BACK moved from the up arrow to Capture MIDI
+        # because paging needs it; sending BACK flips the screen, which flips
+        # the driver back to launcher mode.
         if ccnum == 0x5B:
+            self._set_step_page(self._step_offset - SS_NUM_STEPS)
+            return True
+        if ccnum == 0x5C:
+            self._set_step_page(self._step_offset + SS_NUM_STEPS)
+            return True
+        if ccnum == CC_CAPTURE:
             self._state_manager.send_cuia("BACK")
             return True
         if ccnum == 0x5D:
@@ -665,6 +709,7 @@ class StepSeqHandler(ModeHandlerBase):
             self._leds.cc_off(ccnum)
         for arrow in (0x5B, 0x5C, 0x5D, 0x5E):
             self._leds.cc_off(arrow)
+        self._leds.cc_off(CC_CAPTURE)
 
     def _render_instruments(self):
         for index in range(8):
@@ -699,18 +744,23 @@ class StepSeqHandler(ModeHandlerBase):
 
     def _render_steps(self):
         note_pad = self._selected_note
-        used = self._steps_in_pattern()
-        for step in range(SS_NUM_STEPS):
-            note = self._step_pad(step)
-            if step >= used:
+        length = self._pattern_length()
+        for index in range(SS_NUM_STEPS):
+            note = self._step_pad(index)
+            step = self._step_offset + index
+            if step >= length:
                 self._leds.pad_off(note)
                 continue
             # The playhead wins over everything, including empty steps, so the
-            # current position stays visible even with sparse patterns.
+            # current position stays visible even with sparse patterns. It is
+            # drawn only while it is inside the window: the window never chases
+            # the playhead, so on a long pattern it simply leaves the view.
             if step == self._playhead_step:
                 self._leds.pad_on(note, COLORS.PLAYHEAD, 2)
                 continue
             if note_pad is None or self._libseq.getNoteStart(step, note_pad["note"]) == -1:
+                # Absolute step, so beats still line up across a page boundary -
+                # 16 is a multiple of 4.
                 if step % 4 == 0:
                     self._leds.pad_on(note, COLORS.BEAT_MARKER)
                 else:
@@ -741,7 +791,7 @@ class StepSeqHandler(ModeHandlerBase):
                         self._selected_seq[0],
                         self._selected_seq[1])
                     index = int(position) // clocks_per_step
-                    new_step = index if index < self._steps_in_pattern() else None
+                    new_step = index if index < self._pattern_length() else None
             if new_step != self._playhead_step:
                 self._playhead_step = new_step
                 self._render_steps()
