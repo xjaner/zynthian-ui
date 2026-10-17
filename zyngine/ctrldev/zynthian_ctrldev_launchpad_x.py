@@ -889,6 +889,29 @@ class StepSeqHandler(ModeHandlerBase):
         self._save_selection()
         self.refresh()
 
+    def _mark_pattern_changed(self):
+        """Tell the pattern editor its pattern was edited, so undo can see it.
+
+        The pattern editor keeps libseq's undo stack by flagging itself changed
+        and letting refresh_status() push a snapshot on its own timer. The
+        driver writes notes straight through libseq, bypassing that flag, so
+        without this its edits never reach the snapshot stack: undo appears to
+        do nothing, and redo has nothing to restore. Setting the flag is enough
+        - the GUI batches its own snapshots by SAVE_SNAPSHOT_DELAY, and ours
+        follow the same rhythm, so a burst of pad presses undoes as one step.
+
+        The reference APC driver has this same gap, with savePatternSnapshot()
+        commented out.
+        """
+        try:
+            zyngui = zynthian_gui_config.zyngui
+            if zyngui is not None:
+                patted = zyngui.screens.get("pattern_editor")
+                if patted is not None:
+                    patted.changed = True
+        except Exception as ex:
+            logging.debug(f"Launchpad X could not flag the pattern as changed: {ex}")
+
     # ----- sequencer operations -----------------------------------------
 
     def _toggle_step(self, step):
@@ -904,6 +927,7 @@ class StepSeqHandler(ModeHandlerBase):
                 self._chain_midi_chan())
         else:
             self._libseq.removeNote(step, note)
+        self._mark_pattern_changed()
         self._render_steps()
 
     def _restrike_step(self, step):
@@ -915,6 +939,7 @@ class StepSeqHandler(ModeHandlerBase):
             return
         velocity = self._brush_velocity
         self._libseq.setNoteVelocity(step, note, velocity)
+        self._mark_pattern_changed()
         self._note_player.play(
             note, velocity, note_pad["duration"], self._chain_midi_chan())
         self._render_steps()
