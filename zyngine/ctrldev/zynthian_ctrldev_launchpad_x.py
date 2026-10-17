@@ -77,12 +77,16 @@ SS_ROW_VELOCITY = 3       # Velocity brush pads
 SS_NUM_STEPS = 16
 SS_NUM_VELOCITIES = 5
 # Instruments shown per page on the top row. The last instrument on the last
-# page is followed by the "+" slot, so a page that is exactly full has nowhere
-# to put it and it is omitted.
+# page is followed by the "+" slot.
 SS_NUM_INSTRUMENTS = 8
-# Lowest note offered by the sequential "+" assignment, so additions do not
-# land on the very low notes that percussion mappings rarely use.
+# Lowest note offered by the default instrument bank and by the sequential "+"
+# assignment, so additions do not land on the very low notes that percussion
+# mappings rarely use.
 SS_FIRST_OFFERED_NOTE = 36
+# Notes offered when the pattern does not supply them. Without this an empty
+# pattern leaves the top row with nothing selectable, and no step can be written
+# at all - the same failure as having no instrument bound.
+SS_DEFAULT_INSTRUMENTS = 16
 
 # Safety valve for the instrument scan. libseq offers no way to list the notes a
 # pattern holds, so the notes are discovered by probing getNoteStart() over the
@@ -396,6 +400,12 @@ class StepSeqHandler(ModeHandlerBase):
         # never moved by the playhead - only by the player pressing Up/Down.
         self._step_offset = 0
         self._held_instrument = None
+        # Whether the instrument pad being held is the "+" slot, latched on
+        # press so a page change during the hold cannot change the answer.
+        self._pressed_add_column = False
+        # Set when a note is learned during a hold, so the release does not also
+        # assign a sequential one.
+        self._added_during_hold = False
         self._playhead_step = None
         self._is_playing = False
 
@@ -472,15 +482,24 @@ class StepSeqHandler(ModeHandlerBase):
     def _instrument_list(self):
         """Every instrument reachable, in display order.
 
-        The pattern's own notes come first in ascending order, then anything
-        added by hand that the pattern does not already contain. De-duplicated
-        by note number, so adding an instrument that later appears in the pattern
-        does not make it show up twice.
+        Three sources, merged and de-duplicated by note number:
+
+        1. The pattern's own notes, ascending.
+        2. A default bank from SS_FIRST_OFFERED_NOTE, so an empty pattern still
+           has something selectable. Notes the pattern already provides are not
+           repeated, and the bank neither appears nor disappears as the pattern
+           changes, so the row does not collapse under the player mid-edit.
+        3. Anything added by hand that neither of the above contains.
         """
         if self._instrument_items is not None:
             return self._instrument_items
         items = [NotePad(note) for note in self._derived_notes]
         seen = set(self._derived_notes)
+        for note in range(SS_FIRST_OFFERED_NOTE,
+                          SS_FIRST_OFFERED_NOTE + SS_DEFAULT_INSTRUMENTS):
+            if note not in seen:
+                items.append(NotePad(note))
+                seen.add(note)
         for pad in self._extras:
             note = pad["note"]
             if note not in seen:
@@ -493,11 +512,21 @@ class StepSeqHandler(ModeHandlerBase):
         self._instrument_items = None
 
     def _max_instrument_offset(self):
-        """Highest page offset that still shows an instrument."""
+        """Highest page offset worth showing.
+
+        Normally this is the page holding the last instrument. When the count is
+        an exact multiple of the page size that page is completely full and has
+        no column left for the "+" slot, so one more page is offered - a page
+        holding "+" alone. That keeps the slot reachable from an empty pattern,
+        where the default bank fills both pages exactly.
+        """
         count = len(self._instrument_list())
-        if count <= SS_NUM_INSTRUMENTS:
+        if count <= 0:
             return 0
-        return ((count - 1) // SS_NUM_INSTRUMENTS) * SS_NUM_INSTRUMENTS
+        last = ((count - 1) // SS_NUM_INSTRUMENTS) * SS_NUM_INSTRUMENTS
+        if count % SS_NUM_INSTRUMENTS == 0:
+            last += SS_NUM_INSTRUMENTS
+        return last
 
     def _set_instrument_page(self, offset):
         """Page the instrument row. Clamped, so the arrows are safe to mash."""
@@ -521,7 +550,14 @@ class StepSeqHandler(ModeHandlerBase):
         return self._instrument_offset + col == len(self._instrument_list())
 
     def _add_instrument(self, note, velocity=100, duration=1.0):
-        """Append an instrument, unless the pattern already provides it."""
+        """Append an instrument, unless it is already reachable.
+
+        The check covers the pattern as well as previous additions. Returning
+        True without changing anything would make note_off believe a note had
+        been learned and assign a second, unwanted one on release.
+        """
+        if note in self._derived_notes:
+            return False
         for pad in self._extras:
             if pad["note"] == note:
                 return False
@@ -670,7 +706,9 @@ class StepSeqHandler(ModeHandlerBase):
             # The "+" column is a listening slot, not an instrument: holding it
             # and playing a note appends that instrument to the list.
             self._held_instrument = col
-            if self._is_add_column(col):
+            self._pressed_add_column = self._is_add_column(col)
+            self._added_during_hold = False
+            if self._pressed_add_column:
                 self._enable_midi_listening()
                 return True
             self._select_instrument(col)
@@ -695,15 +733,19 @@ class StepSeqHandler(ModeHandlerBase):
         col, row = self._driver.get_note_xy(note)
 
         if row == SS_ROW_INSTRUMENTS and col < SS_NUM_INSTRUMENTS:
-            was_add_column = self._is_add_column(col)
-            count_before = len(self._instrument_list())
+            # Whether this is the "+" column is decided on press. Learning a
+            # note during the hold moves the page, so re-checking at release
+            # would compare a stale column against a new page and misfire.
+            was_add_column = self._pressed_add_column
+            self._pressed_add_column = False
+            learned = self._added_during_hold
+            self._added_during_hold = False
             self._held_instrument = None
             self._disable_midi_listening()
             # Releasing "+" with nothing learned during the hold assigns the
             # next free note, so an instrument can be added with no second
-            # device. If a note did arrive it is already in the list, and the
-            # count check leaves it alone.
-            if was_add_column and len(self._instrument_list()) == count_before:
+            # device.
+            if was_add_column and not learned:
                 self._assign_next_instrument()
             return True
 
@@ -836,6 +878,7 @@ class StepSeqHandler(ModeHandlerBase):
             # Already known - just move the selection to it.
             self._select_note(note)
             return
+        self._added_during_hold = True
         # Additions go on the end of the list rather than into a fixed slot,
         # because slot positions move once the row pages.
         self._reveal_new_instrument()
