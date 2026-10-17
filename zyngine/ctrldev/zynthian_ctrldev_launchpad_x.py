@@ -80,6 +80,9 @@ SS_NUM_VELOCITIES = 5
 # page is followed by the "+" slot, so a page that is exactly full has nowhere
 # to put it and it is omitted.
 SS_NUM_INSTRUMENTS = 8
+# Lowest note offered by the sequential "+" assignment, so additions do not
+# land on the very low notes that percussion mappings rarely use.
+SS_FIRST_OFFERED_NOTE = 36
 
 # Safety valve for the instrument scan. libseq offers no way to list the notes a
 # pattern holds, so the notes are discovered by probing getNoteStart() over the
@@ -526,6 +529,47 @@ class StepSeqHandler(ModeHandlerBase):
         self._invalidate_instruments()
         return True
 
+    def _next_free_note(self):
+        """The next note to offer when no other device can supply one.
+
+        Sequential from just above everything already in the list, so repeated
+        additions are identifiable by their order and never collide with the
+        pattern. Returns None only when the whole range is taken.
+        """
+        used = {pad["note"] for pad in self._instrument_list()}
+        if used and max(used) < 127:
+            return max(used) + 1
+        for note in range(SS_FIRST_OFFERED_NOTE, 128):
+            if note not in used:
+                return note
+        return None
+
+    def _reveal_new_instrument(self):
+        """Page to the instrument just appended and select it."""
+        position = len(self._instrument_list()) - 1
+        self._instrument_offset = (position // SS_NUM_INSTRUMENTS) * SS_NUM_INSTRUMENTS
+        self._selected_note_pad = position - self._instrument_offset
+        self._save_selection()
+        self.refresh()
+
+    def _assign_next_instrument(self):
+        """Add the next free note and audition it.
+
+        This is what a tap on "+" does when no note arrived during the hold, so
+        an instrument can be added with no second device attached at all. The
+        player hears the note immediately and decides whether to keep it.
+        """
+        note = self._next_free_note()
+        if note is None:
+            logging.warning("Launchpad X no free MIDI note left for an addition")
+            return None
+        if not self._add_instrument(note, 100, 1.0):
+            return None
+        self._reveal_new_instrument()
+        self._note_player.play(
+            note, self._brush_velocity, 1.0, self._chain_midi_chan())
+        return note
+
     @property
     def _brush_velocity(self):
         return SS_VELOCITY_VALUES[self._brush]
@@ -651,8 +695,16 @@ class StepSeqHandler(ModeHandlerBase):
         col, row = self._driver.get_note_xy(note)
 
         if row == SS_ROW_INSTRUMENTS and col < SS_NUM_INSTRUMENTS:
+            was_add_column = self._is_add_column(col)
+            count_before = len(self._instrument_list())
             self._held_instrument = None
             self._disable_midi_listening()
+            # Releasing "+" with nothing learned during the hold assigns the
+            # next free note, so an instrument can be added with no second
+            # device. If a note did arrive it is already in the list, and the
+            # count check leaves it alone.
+            if was_add_column and len(self._instrument_list()) == count_before:
+                self._assign_next_instrument()
             return True
 
         index = self._note_to_step(note)
@@ -784,12 +836,9 @@ class StepSeqHandler(ModeHandlerBase):
             # Already known - just move the selection to it.
             self._select_note(note)
             return
-        # Show the new instrument: page to it and select it.
-        position = len(self._instrument_list()) - 1
-        self._instrument_offset = (position // SS_NUM_INSTRUMENTS) * SS_NUM_INSTRUMENTS
-        self._selected_note_pad = position - self._instrument_offset
-        self._save_selection()
-        self.refresh()
+        # Additions go on the end of the list rather than into a fixed slot,
+        # because slot positions move once the row pages.
+        self._reveal_new_instrument()
 
     def _select_note(self, note):
         """Select a note already present in the list, if it is on the current page."""
