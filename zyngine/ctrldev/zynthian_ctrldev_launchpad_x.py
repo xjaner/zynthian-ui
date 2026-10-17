@@ -705,6 +705,13 @@ class StepSeqHandler(ModeHandlerBase):
         self._render_transport()
 
     def control_off(self):
+        # Launcher mode paints the grid straight through lib_zyncore, bypassing
+        # this LED layer, so those pads are untracked here and would survive a
+        # mode switch. The stepsequencer only paints rows 0-3, so anything the
+        # launcher left in rows 4-7 has to be cleared explicitly.
+        for row in range(8):
+            for col in range(8):
+                self._leds.pad_off(self._driver.get_note_from_xy(col, row))
         for ccnum in (89, 79, 69, 59, 49, 39, 29, 19):
             self._leds.cc_off(ccnum)
         for arrow in (0x5B, 0x5C, 0x5D, 0x5E):
