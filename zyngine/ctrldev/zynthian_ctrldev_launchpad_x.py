@@ -400,6 +400,9 @@ class StepSeqHandler(ModeHandlerBase):
         # never moved by the playhead - only by the player pressing Up/Down.
         self._step_offset = 0
         self._held_instrument = None
+        # The note currently highlighted on the on-screen pattern editor, so the
+        # highlight can be withdrawn on release.
+        self._ui_note = None
         # Whether the instrument pad being held is the "+" slot, latched on
         # press so a page change during the hold cannot change the answer.
         self._pressed_add_column = False
@@ -422,6 +425,7 @@ class StepSeqHandler(ModeHandlerBase):
             self.refresh()
         else:
             self._playhead.set_enabled(False)
+            self._ui_clear_note()
             self._leds.all_off()
 
     # ----- state ---------------------------------------------------------
@@ -741,6 +745,7 @@ class StepSeqHandler(ModeHandlerBase):
             learned = self._added_during_hold
             self._added_during_hold = False
             self._held_instrument = None
+            self._ui_clear_note()
             self._disable_midi_listening()
             # Releasing "+" with nothing learned during the hold assigns the
             # next free note, so an instrument can be added with no second
@@ -792,11 +797,75 @@ class StepSeqHandler(ModeHandlerBase):
             self._toggle_play()
         return True
 
+    # ----- on-screen pattern editor ---------------------------------------
+    #
+    # Mirrors the pad's instrument selection onto the touchscreen, so the two do
+    # not disagree about which note is being edited. This reaches into the GUI
+    # directly, which the Zynthian codebase already does from ModeHandlerBase
+    # (_get_selected_step) and from the Launchpad Pro MK2 driver. Every call is
+    # best-effort: the driver must keep working if the screen is elsewhere, if
+    # the note is not in the chain's keymap, or if the UI changes shape.
+
+    def _pattern_editor(self):
+        """The on-screen pattern editor, or None when it is not the current screen."""
+        try:
+            zyngui = zynthian_gui_config.zyngui
+            if zyngui is None or zyngui.current_screen != "pattern_editor":
+                return None
+            return zyngui.screens.get("pattern_editor")
+        except Exception as ex:
+            logging.debug(f"Launchpad X pattern editor unavailable: {ex}")
+            return None
+
+    def _ui_select_note(self, note):
+        """Scroll the pattern editor to `note`, select it and highlight it.
+
+        The editor addresses notes by row, resolved through the chain's keymap,
+        so a note the patch does not map simply has no row: that is ignored
+        rather than treated as a failure.
+        """
+        pe = self._pattern_editor()
+        if pe is None or note is None:
+            return False
+        try:
+            row = pe.get_row_from_note(note)
+            if row is None:
+                return False
+            pe.pianoroll_note_on(note)
+            # pianoroll_note_on only moves the selection when the row is off
+            # screen, so select explicitly to keep the two in step either way.
+            pe.select_cell(None, row)
+            self._ui_note = note
+            return True
+        except Exception as ex:
+            logging.error(f"Launchpad X could not update the pattern editor: {ex}")
+            return False
+
+    def _ui_clear_note(self):
+        """Withdraw the highlight left by _ui_select_note."""
+        if self._ui_note is None:
+            return False
+        note = self._ui_note
+        self._ui_note = None
+        pe = self._pattern_editor()
+        if pe is None:
+            return False
+        try:
+            pe.pianoroll_note_off(note)
+            return True
+        except Exception as ex:
+            logging.error(f"Launchpad X could not clear the pattern editor: {ex}")
+            return False
+
     def _select_instrument(self, index):
         self._selected_note_pad = index
         self._enable_midi_listening()
+        # Withdraw any highlight from a previous selection first, so moving
+        # between instruments does not leave the old one lit on the screen.
+        self._ui_clear_note()
         note_pad = self._selected_note
         if note_pad is not None:
+            self._ui_select_note(note_pad["note"])
             self._note_player.play(
                 note_pad["note"], self._brush_velocity,
                 note_pad["duration"], self._chain_midi_chan())
