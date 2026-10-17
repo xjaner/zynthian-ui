@@ -61,6 +61,15 @@ CC_CAPTURE = 98
 
 # Step sequencer screen layout.
 #
+#     row 0  instruments          (8 per page, Left/Right)
+#     row 1  steps 1-8
+#     row 2  steps 9-16
+#     row 3  steps 17-24
+#     row 4  steps 25-32
+#     row 5  -                     gap, left dark to separate the lanes
+#     row 6  velocity             (5 levels)
+#     row 7  -                     gap
+#
 # Row indices here are DRIVER rows, which run opposite to physical rows.
 # get_note_from_xy() maps note = 10 * (8 - row) + col + 1, therefore:
 #
@@ -71,10 +80,10 @@ CC_CAPTURE = 98
 # notes 81-88 lights the top row. These constants are therefore counted
 # from the physical top, which means LOW driver row numbers.
 SS_ROW_INSTRUMENTS = 0    # Physical top: instrument (note) pads
-SS_ROW_STEPS_A = 1        # Steps 1-8
-SS_ROW_STEPS_B = 2        # Steps 9-16
-SS_ROW_VELOCITY = 3       # Velocity brush pads
-SS_NUM_STEPS = 16
+# Four rows of 8 steps each: 1-8, 9-16, 17-24, 25-32.
+SS_ROW_STEPS = (1, 2, 3, 4)
+SS_ROW_VELOCITY = 6       # Velocity brush pads, below a gap from the steps
+SS_NUM_STEPS = 32
 SS_NUM_VELOCITIES = 5
 # Instruments shown per page on the top row. The last instrument on the last
 # page is followed by the "+" slot.
@@ -623,17 +632,15 @@ class StepSeqHandler(ModeHandlerBase):
         return self._driver.get_note_from_xy(index, SS_ROW_VELOCITY)
 
     def _step_pad(self, index):
-        """Pad for a window-relative step, 0-15."""
-        row = SS_ROW_STEPS_A if index < 8 else SS_ROW_STEPS_B
-        return self._driver.get_note_from_xy(index % 8, row)
+        """Pad for a window-relative step, 0-31."""
+        return self._driver.get_note_from_xy(
+            index % 8, SS_ROW_STEPS[index // 8])
 
     def _note_to_step(self, note):
         """Window-relative step for a pad note, or None if it is not a step pad."""
         col, row = self._driver.get_note_xy(note)
-        if row == SS_ROW_STEPS_A:
-            return col
-        if row == SS_ROW_STEPS_B:
-            return 8 + col
+        if row in SS_ROW_STEPS:
+            return SS_ROW_STEPS.index(row) * 8 + col
         return None
 
     def _pattern_length(self):
