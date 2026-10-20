@@ -61,14 +61,17 @@ CC_CAPTURE = 98
 
 # Step sequencer screen layout.
 #
-#     row 0  instruments          (8 per page, Left/Right)
-#     row 1  steps 1-8
-#     row 2  steps 9-16
-#     row 3  steps 17-24
-#     row 4  steps 25-32
-#     row 5  -                     gap, left dark to separate the lanes
-#     row 6  velocity             (5 levels)
-#     row 7  -                     gap
+# The grid is a piano roll, laid out like the Zynthian's own pattern editor:
+#
+#     every ROW is an instrument (a row of the chain's keymap)
+#     every COLUMN is a step
+#
+# so 8 instruments x 8 steps are visible at once. The column of buttons to the
+# right of the grid is the control strip:
+#
+#     button 1     play / stop
+#     buttons 2-6  velocity brush
+#     buttons 7-8  spare
 #
 # Row indices here are DRIVER rows, which run opposite to physical rows.
 # get_note_from_xy() maps note = 10 * (8 - row) + col + 1, therefore:
@@ -79,36 +82,29 @@ CC_CAPTURE = 98
 # Verified on hardware: sending notes 11-18 lights the bottom row and
 # notes 81-88 lights the top row. These constants are therefore counted
 # from the physical top, which means LOW driver row numbers.
-SS_ROW_INSTRUMENTS = 0    # Physical top: instrument (note) pads
-# Four rows of 8 steps each: 1-8, 9-16, 17-24, 25-32.
-SS_ROW_STEPS = (1, 2, 3, 4)
-SS_ROW_VELOCITY = 6       # Velocity brush pads, below a gap from the steps
-SS_NUM_STEPS = 32
-SS_NUM_VELOCITIES = 5
-# Instruments shown per page on the top row. The last instrument on the last
-# page is followed by the "+" slot.
-SS_NUM_INSTRUMENTS = 8
-# Lowest note offered by the default instrument bank and by the sequential "+"
-# assignment, so additions do not land on the very low notes that percussion
-# mappings rarely use.
-SS_FIRST_OFFERED_NOTE = 36
-# Notes offered when the pattern does not supply them. Without this an empty
-# pattern leaves the top row with nothing selectable, and no step can be written
-# at all - the same failure as having no instrument bound.
-SS_DEFAULT_INSTRUMENTS = 16
+#
+# The Zynthian's piano roll is the other way up: keymap row 0 is the BOTTOM
+# (lowest note) and higher rows are higher up. _keymap_index() reconciles the
+# two, so the pad shows the same instruments in the same order as the screen.
+SS_NUM_ROWS = 8        # Instrument rows visible at once
+SS_NUM_COLS = 8        # Step columns visible at once
+SS_NUM_VELOCITIES = 5  # Velocity levels offered by the brush
+# Steps per beat, used to mark the downbeats in the grid.
+SS_BEAT_DIVISION = 4
 
-# Safety valve for the instrument scan. libseq offers no way to list the notes a
-# pattern holds, so the notes are discovered by probing getNoteStart() over the
-# whole grid: up to 128 notes x this many steps. Only ever run on entering the
-# mode or when the pattern changes, never on a repaint.
-SS_SCAN_MAX_STEPS = 256
+# The column of buttons to the right of the grid, as CC numbers, in driver
+# row order. The launcher mode uses these to trigger phrases; in stepsequencer
+# mode they are the control strip.
+SS_RIGHT_COL_CCS = (89, 79, 69, 59, 49, 39, 29, 19)
+CC_TRANSPORT = SS_RIGHT_COL_CCS[0]
+SS_VELOCITY_CCS = SS_RIGHT_COL_CCS[1:6]
 
 # Note-off happens before this many seconds elapse => plain toggle.
-# Above it => long press, which re-strikes the step at the current brush velocity.
+# Above it => long press, which selects the note instead of toggling it.
 SS_LONG_PRESS_TIME = 0.5
 
-# Discrete velocity levels offered on the velocity lane, ordered LOW -> HIGH.
-# A selected level is applied to any step pad that is subsequently toggled on.
+# Discrete velocity levels offered by the brush, ordered LOW -> HIGH.
+# A new note is created at the selected level.
 SS_VELOCITY_VALUES = [25, 50, 75, 100, 127]
 SS_VELOCITY_DEFAULT = 2  # index into SS_VELOCITY_VALUES
 
@@ -137,18 +133,9 @@ class COLORS:
     # Dim marker for the first step of each beat, and for unused pads.
     BEAT_MARKER = 1
     OFF = 0
-    # Bright overlay for the step currently under the playhead.
+    # Bright overlay for the column currently under the playhead.
     PLAYHEAD = 3
-    # Instrument pads
-    INSTRUMENT = 21
-    INSTRUMENT_SELECTED = 3
-    # Instrument slot with no note behind it. Same hue as INSTRUMENT but dim, so
-    # an unconfigured grid reads as "nothing here yet" instead of looking ready.
-    INSTRUMENT_EMPTY = 23
-    # The "+" slot: holds an instrument pad and plays a note when you hold it,
-    # to append an instrument that the pattern does not contain yet.
-    INSTRUMENT_ADD = 9
-    # Velocity lane
+    # Velocity brush buttons (right column)
     VELOCITY_LANE = 18
     VELOCITY_LANE_SELECTED = 3
     # Transport buttons (right column)
@@ -156,42 +143,17 @@ class COLORS:
     TRANSPORT_ACTIVE = 21
 
 
-# ------------------------------------------------------------------------------------------------------------------
-# Instrument pad storage. Inherits from dict to stay JSON-serializable.
-# ------------------------------------------------------------------------------------------------------------------
-class NotePad(dict):
-
-    def __init__(self, note, velocity=100, duration=1.0):
-        super().__init__(note=note, velocity=velocity, duration=duration)
-
-    def __getattr__(self, name):
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError(name)
-
-    def __setattr__(self, name, value):
-        self[name] = value
-
-
 def _migrate_extras(chain):
     """Normalise saved instrument storage to the current ordered form.
 
     Earlier revisions stored MIDI-learned instruments in a dict keyed by the slot
-    they occupied on the top row. Slot positions stopped meaning anything once
-    that row became a scrolling window, so those entries become plain additions,
-    in slot order, and the old key is dropped. This keeps an instrument learned
-    before the upgrade rather than silently losing it.
+    they occupied on the top row, and later revisions stored them as an ordered
+    "extras" list. The piano roll layout takes its instruments from the chain's
+    keymap instead, so there is nothing to keep: the list is dropped.
     """
-    if "extras" in chain:
-        chain["extras"] = [
-            e if isinstance(e, NotePad) else NotePad(**e) for e in chain["extras"]]
-    else:
-        pads = chain.get("pads", {})
-        chain["extras"] = [NotePad(**p) for _, p
-                           in sorted(pads.items(), key=lambda kv: int(kv[0]))]
-        chain.pop("pads", None)
-    return chain["extras"]
+    chain.pop("pads", None)
+    chain.pop("extras", None)
+    return chain
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -207,7 +169,7 @@ class StepSeqState:
         state = deepcopy(state)
         self._chains = state.get("chains", {})
         for chain in self._chains.values():
-            chain["extras"] = _migrate_extras(chain)
+            _migrate_extras(chain)
             chain.setdefault("brush", SS_VELOCITY_DEFAULT)
         for seq, value in state.get("seqs", {}).items():
             self._seqs[int(seq)] = value
@@ -219,7 +181,7 @@ class StepSeqState:
         key = str(chain_id) if chain_id is not None else "default"
         chain = self._chains.get(key)
         if chain is None:
-            chain = {"extras": [], "brush": SS_VELOCITY_DEFAULT}
+            chain = {"brush": SS_VELOCITY_DEFAULT}
             self._chains[key] = chain
         return chain
 
@@ -380,6 +342,21 @@ class FeedbackLEDs:
 # Step sequencer mode handler
 # ------------------------------------------------------------------------------------------------------------------
 class StepSeqHandler(ModeHandlerBase):
+    """Piano-roll step sequencer.
+
+    The grid mirrors the Zynthian's own pattern editor: every row is an
+    instrument (a row of the chain's keymap) and every column is a step, so
+    eight instruments and eight steps are visible at once. The column of
+    buttons to the right of the grid is the control strip: play/stop, the
+    velocity brush, and two spare buttons.
+
+    The instrument rows come from the chain's keymap, which is the authoritative
+    list of the notes its patch responds to. Earlier revisions of this driver
+    had to guess that list - by scanning the pattern for the notes it held, and
+    falling back to a default bank of note numbers - because there was nowhere
+    else to get it. Reading the keymap removes the guesswork entirely, and
+    makes the pad and the screen agree about which instrument a row is.
+    """
 
     def __init__(self, state_manager, driver, idev_in):
         super().__init__(state_manager)
@@ -392,32 +369,25 @@ class StepSeqHandler(ModeHandlerBase):
         self._playhead = PlayheadMonitor(self._update_playhead)
 
         self._selected_seq = (0, 0)
-        self._selected_note_pad = 0
-        self._brush = SS_VELOCITY_DEFAULT
-        self._extras = []
-        # Notes read out of the pattern itself, ascending. Transient: this is
-        # rebuilt from the sequencer and deliberately never saved to the
-        # snapshot, so a stale list can never outlive the pattern it came from.
-        self._derived_notes = []
-        # Cached result of _instrument_list(), rebuilt lazily.
-        self._instrument_items = None
-        self._instrument_offset = 0
         self._chain_id = None
+        self._brush = SS_VELOCITY_DEFAULT
 
-        self._pressed_steps = {}
-        # Absolute step shown at the left edge of the step window. The window is
-        # never moved by the playhead - only by the player pressing Up/Down.
+        # The chain's keymap: the notes the patch responds to, in screen order.
+        self._keymap = []
+        # Index of the first keymap row shown on the pad. The piano roll is
+        # bottom-up and the pad is top-down, so the pad's top row shows the
+        # highest keymap row of the window.
+        self._row_offset = 0
+        # The keymap row and the step the cursor is on.
+        self._selected_row = 0
+        self._selected_step = 0
+        # First step shown in the grid. The window follows the playhead while
+        # the pattern plays.
         self._step_offset = 0
-        self._held_instrument = None
-        # The note currently highlighted on the on-screen pattern editor, so the
-        # highlight can be withdrawn on release.
-        self._ui_note = None
-        # Whether the instrument pad being held is the "+" slot, latched on
-        # press so a page change during the hold cannot change the answer.
-        self._pressed_add_column = False
-        # Set when a note is learned during a hold, so the release does not also
-        # assign a sequential one.
-        self._added_during_hold = False
+
+        # Presses in flight, keyed by the pad note so that a window moving
+        # under a held pad cannot make the release land on the wrong cell.
+        self._pressed_cells = {}
         self._playhead_step = None
         self._is_playing = False
 
@@ -434,7 +404,6 @@ class StepSeqHandler(ModeHandlerBase):
             self.refresh()
         else:
             self._playhead.set_enabled(False)
-            self._ui_clear_note()
             self._leds.all_off()
 
     # ----- state ---------------------------------------------------------
@@ -459,165 +428,37 @@ class StepSeqHandler(ModeHandlerBase):
         self._selected_seq = (phrase, chan)
         self._chain_id = self._get_chain_id_by_sequence(phrase, chan)
         chain = self._saved_state.get_chain(self._chain_id)
-        self._extras = chain["extras"]
-        pad, brush = self._saved_state.get_selection_by_sequence(phrase * 256 + chan)
-        self._selected_note_pad = pad if 0 <= pad < SS_NUM_INSTRUMENTS else 0
+        brush = chain.get("brush", SS_VELOCITY_DEFAULT)
         self._brush = brush if 0 <= brush < SS_NUM_VELOCITIES else SS_VELOCITY_DEFAULT
-        # The pattern is the default source of instruments, so it has to be read
-        # whenever the sequence being edited changes.
+        self._row_offset = 0
         self._step_offset = 0
-        self._instrument_offset = 0
-        self.rescan_instruments()
+        self._selected_row = 0
+        self._selected_step = 0
+        self._load_keymap()
 
     def _save_selection(self):
         self._saved_state.get_chain(self._chain_id)["brush"] = self._brush
-        self._saved_state.set_selection_by_sequence(
-            self._selected_seq[0] * 256 + self._selected_seq[1],
-            self._selected_note_pad, self._brush)
 
-    @property
-    def _selected_note(self):
-        return self._note_pad_at(self._selected_note_pad)
+    def _load_keymap(self):
+        """Read the chain's keymap from the pattern editor.
 
-    def _note_pad_at(self, index):
-        """The instrument shown in top-row column `index`, or None if empty.
-
-        `index` is a column on the current page, not an absolute position. When
-        that column is the "+" slot it resolves to None as well - callers must
-        treat None as "no instrument selected" rather than as note 0.
+        The keymap is the screen's own list of the notes this chain responds
+        to, and it is rebuilt whenever the pattern editor loads a pattern. It
+        lives on the GUI rather than in libseq, so it is read from there - the
+        same access ModeHandlerBase already uses.
         """
-        items = self._instrument_list()
-        position = self._instrument_offset + index
-        if 0 <= position < len(items):
-            return items[position]
-        return None
-
-    def _instrument_list(self):
-        """Every instrument reachable, in display order.
-
-        Three sources, merged and de-duplicated by note number:
-
-        1. The pattern's own notes, ascending.
-        2. A default bank from SS_FIRST_OFFERED_NOTE, so an empty pattern still
-           has something selectable. Notes the pattern already provides are not
-           repeated, and the bank neither appears nor disappears as the pattern
-           changes, so the row does not collapse under the player mid-edit.
-        3. Anything added by hand that neither of the above contains.
-        """
-        if self._instrument_items is not None:
-            return self._instrument_items
-        items = [NotePad(note) for note in self._derived_notes]
-        seen = set(self._derived_notes)
-        for note in range(SS_FIRST_OFFERED_NOTE,
-                          SS_FIRST_OFFERED_NOTE + SS_DEFAULT_INSTRUMENTS):
-            if note not in seen:
-                items.append(NotePad(note))
-                seen.add(note)
-        for pad in self._extras:
-            note = pad["note"]
-            if note not in seen:
-                items.append(NotePad(note, pad["velocity"], pad["duration"]))
-                seen.add(note)
-        return items
-
-    def _invalidate_instruments(self):
-        """Drop the cached instrument list; call after anything that changes it."""
-        self._instrument_items = None
-
-    def _max_instrument_offset(self):
-        """Highest page offset worth showing.
-
-        Normally this is the page holding the last instrument. When the count is
-        an exact multiple of the page size that page is completely full and has
-        no column left for the "+" slot, so one more page is offered - a page
-        holding "+" alone. That keeps the slot reachable from an empty pattern,
-        where the default bank fills both pages exactly.
-        """
-        count = len(self._instrument_list())
-        if count <= 0:
-            return 0
-        last = ((count - 1) // SS_NUM_INSTRUMENTS) * SS_NUM_INSTRUMENTS
-        if count % SS_NUM_INSTRUMENTS == 0:
-            last += SS_NUM_INSTRUMENTS
-        return last
-
-    def _set_instrument_page(self, offset):
-        """Page the instrument row. Clamped, so the arrows are safe to mash."""
-        self._instrument_offset = max(
-            0, min(offset, self._max_instrument_offset()))
-        self._clamp_selected_instrument()
-        self._render_instruments()
-        self._render_steps()
-
-    def _clamp_selected_instrument(self):
-        """Keep the selection on a column that actually shows an instrument."""
-        if self._selected_note is not None:
-            return
-        for col in range(SS_NUM_INSTRUMENTS):
-            if self._note_pad_at(col) is not None:
-                self._selected_note_pad = col
-                return
-
-    def _is_add_column(self, col):
-        """True when this column holds the "+" slot rather than an instrument."""
-        return self._instrument_offset + col == len(self._instrument_list())
-
-    def _add_instrument(self, note, velocity=100, duration=1.0):
-        """Append an instrument, unless it is already reachable.
-
-        The check covers the pattern as well as previous additions. Returning
-        True without changing anything would make note_off believe a note had
-        been learned and assign a second, unwanted one on release.
-        """
-        if note in self._derived_notes:
-            return False
-        for pad in self._extras:
-            if pad["note"] == note:
-                return False
-        self._extras.append(NotePad(note, velocity, duration))
-        self._invalidate_instruments()
-        return True
-
-    def _next_free_note(self):
-        """The next note to offer when no other device can supply one.
-
-        Sequential from just above everything already in the list, so repeated
-        additions are identifiable by their order and never collide with the
-        pattern. Returns None only when the whole range is taken.
-        """
-        used = {pad["note"] for pad in self._instrument_list()}
-        if used and max(used) < 127:
-            return max(used) + 1
-        for note in range(SS_FIRST_OFFERED_NOTE, 128):
-            if note not in used:
-                return note
-        return None
-
-    def _reveal_new_instrument(self):
-        """Page to the instrument just appended and select it."""
-        position = len(self._instrument_list()) - 1
-        self._instrument_offset = (position // SS_NUM_INSTRUMENTS) * SS_NUM_INSTRUMENTS
-        self._selected_note_pad = position - self._instrument_offset
-        self._save_selection()
-        self.refresh()
-
-    def _assign_next_instrument(self):
-        """Add the next free note and audition it.
-
-        This is what a tap on "+" does when no note arrived during the hold, so
-        an instrument can be added with no second device attached at all. The
-        player hears the note immediately and decides whether to keep it.
-        """
-        note = self._next_free_note()
-        if note is None:
-            logging.warning("Launchpad X no free MIDI note left for an addition")
-            return None
-        if not self._add_instrument(note, 100, 1.0):
-            return None
-        self._reveal_new_instrument()
-        self._note_player.play(
-            note, self._brush_velocity, 1.0, self._chain_midi_chan())
-        return note
+        pe = self._pattern_editor()
+        keymap = []
+        if pe is not None:
+            try:
+                keymap = list(pe.keymap or [])
+            except Exception as ex:
+                logging.debug(f"Launchpad X could not read the keymap: {ex}")
+        self._keymap = keymap
+        logging.debug(f"Launchpad X keymap -> {len(self._keymap)} rows")
+        if self._keymap:
+            self._selected_row = max(0, min(self._selected_row, len(self._keymap) - 1))
+        self._scroll_row_window()
 
     @property
     def _brush_velocity(self):
@@ -625,23 +466,34 @@ class StepSeqHandler(ModeHandlerBase):
 
     # ----- geometry ------------------------------------------------------
 
-    def _instrument_pad(self, index):
-        return self._driver.get_note_from_xy(index, SS_ROW_INSTRUMENTS)
+    def _keymap_index(self, visible_row):
+        """The keymap row shown in a visible row of the grid.
 
-    def _velocity_pad(self, index):
-        return self._driver.get_note_from_xy(index, SS_ROW_VELOCITY)
+        The piano roll is bottom-up - keymap row 0 is the lowest note and
+        appears at the bottom - while the pad's driver row 0 is the physical
+        top. The two are reconciled here, so the pad shows the instruments in
+        the same order as the screen.
+        """
+        return self._row_offset + (SS_NUM_ROWS - 1 - visible_row)
 
-    def _step_pad(self, index):
-        """Pad for a window-relative step, 0-31."""
-        return self._driver.get_note_from_xy(
-            index % 8, SS_ROW_STEPS[index // 8])
+    def _visible_row(self, keymap_index):
+        """The visible row of the grid showing a keymap row, or None."""
+        row = self._row_offset + SS_NUM_ROWS - 1 - keymap_index
+        return row if 0 <= row < SS_NUM_ROWS else None
 
-    def _note_to_step(self, note):
-        """Window-relative step for a pad note, or None if it is not a step pad."""
+    def _cell_pad(self, col, row):
+        """The grid pad for a step column and a visible row."""
+        return self._driver.get_note_from_xy(col, row)
+
+    def _pad_to_cell(self, note):
+        """The (column, visible row) a grid pad represents, or None.
+
+        The whole grid is the piano roll now, so any grid pad is a cell.
+        """
         col, row = self._driver.get_note_xy(note)
-        if row in SS_ROW_STEPS:
-            return SS_ROW_STEPS.index(row) * 8 + col
-        return None
+        if col < 0 or col >= SS_NUM_COLS or row < 0 or row >= SS_NUM_ROWS:
+            return None
+        return col, row
 
     def _pattern_length(self):
         """Total steps in the pattern, uncapped. 0 when the pattern is empty."""
@@ -650,168 +502,145 @@ class StepSeqHandler(ModeHandlerBase):
         except Exception:
             return 0
 
+    # ----- windows -------------------------------------------------------
+
+    def _max_row_offset(self):
+        """Highest row offset that still shows a keymap row."""
+        return max(0, len(self._keymap) - SS_NUM_ROWS)
+
+    def _scroll_row_window(self):
+        """Keep the selected row inside the visible window."""
+        if not self._keymap:
+            self._row_offset = 0
+            return
+        if self._selected_row < self._row_offset:
+            self._row_offset = self._selected_row
+        elif self._selected_row >= self._row_offset + SS_NUM_ROWS:
+            self._row_offset = self._selected_row - SS_NUM_ROWS + 1
+        self._row_offset = max(0, min(self._row_offset, self._max_row_offset()))
+
     def _max_step_offset(self):
-        """Highest window offset that still shows content, snapped to a page."""
-        length = self._pattern_length()
-        if length <= SS_NUM_STEPS:
-            return 0
-        return ((length - 1) // SS_NUM_STEPS) * SS_NUM_STEPS
+        """Highest step offset that still shows a step."""
+        return max(0, self._pattern_length() - SS_NUM_COLS)
 
-    def _clamp_step_page(self):
-        """Keep the window inside the pattern, e.g. after the pattern shortened."""
-        self._step_offset = max(0, min(self._step_offset, self._max_step_offset()))
-
-    def _set_step_page(self, offset):
+    def _set_step_offset(self, offset):
         """Move the step window. Clamped, so the arrows are safe to mash."""
         self._step_offset = max(0, min(offset, self._max_step_offset()))
-        self._render_steps()
+        self._render_grid()
 
-    def _scan_pattern_notes(self):
-        """Distinct notes held by the current pattern, ascending.
+    def _select_row(self, row):
+        """Move the cursor to a keymap row, scrolling the window and the screen."""
+        if not self._keymap:
+            return
+        self._selected_row = max(0, min(row, len(self._keymap) - 1))
+        self._scroll_row_window()
+        self._sync_screen()
+        self._render_grid()
 
-        libseq exposes no "list the notes" call, so the notes are discovered by
-        probing getNoteStart() across the grid. The loop is note-major so that a
-        note which hits early exits its step loop immediately, which keeps the
-        common case (a handful of instruments across a short pattern) cheap.
-        Bounded by SS_SCAN_MAX_STEPS; a pattern longer than that is scanned only
-        in part, and the truncation is logged rather than hidden.
+    def _sync_screen(self):
+        """Point the on-screen pattern editor at the same cell as the pad.
+
+        The editor owns the scroll position, so the pad's window is pushed to
+        it as well and the two show the same instruments.
         """
-        notes = []
+        pe = self._pattern_editor()
+        if pe is None:
+            return
         try:
-            steps = self._libseq.getSteps()
-            if isinstance(steps, int) and steps > 0:
-                if steps > SS_SCAN_MAX_STEPS:
-                    logging.warning(
-                        f"Launchpad X instrument scan truncated to {SS_SCAN_MAX_STEPS} of {steps} steps")
-                    steps = SS_SCAN_MAX_STEPS
-                for note in range(128):
-                    for step in range(steps):
-                        if self._libseq.getNoteStart(step, note) != -1:
-                            notes.append(note)
-                            break
+            view_rows = getattr(pe, "view_rows", SS_NUM_ROWS) or SS_NUM_ROWS
+            screen_max = max(0, len(self._keymap) - view_rows)
+            pe.set_keymap_offset(min(self._row_offset, screen_max))
+            pe.select_cell(self._selected_step, self._selected_row)
         except Exception as ex:
-            logging.error(f"Launchpad X instrument scan failed: {ex}")
-        return notes
-
-    def rescan_instruments(self):
-        """Rebuild the instrument row from the current pattern."""
-        self._derived_notes = self._scan_pattern_notes()
-        self._invalidate_instruments()
-        logging.debug(f"Launchpad X instrument scan -> {len(self._derived_notes)} notes")
-        # A selection still pointing at a now-empty slot would silently do
-        # nothing on a step press, which is precisely the failure this seeding
-        # exists to remove. Fall back to the first slot that actually has a note.
-        self._instrument_offset = min(self._instrument_offset,
-                                      self._max_instrument_offset())
-        self._clamp_selected_instrument()
-        # The pattern may have been replaced by a shorter one.
-        self._clamp_step_page()
-        return self._derived_notes
+            logging.debug(f"Launchpad X could not sync the pattern editor: {ex}")
 
     # ----- input ---------------------------------------------------------
 
     def note_on(self, note, velocity, shifted_override=None):
-        col, row = self._driver.get_note_xy(note)
-
-        if row == SS_ROW_INSTRUMENTS and col < SS_NUM_INSTRUMENTS:
-            # The "+" column is a listening slot, not an instrument: holding it
-            # and playing a note appends that instrument to the list.
-            self._held_instrument = col
-            self._pressed_add_column = self._is_add_column(col)
-            self._added_during_hold = False
-            if self._pressed_add_column:
-                self._enable_midi_listening()
-                return True
-            self._select_instrument(col)
-            return True
-
-        if row == SS_ROW_VELOCITY and col < SS_NUM_VELOCITIES:
-            self._set_brush(col)
-            return True
-
-        index = self._note_to_step(note)
-        if index is not None:
-            # Keyed by ABSOLUTE step, so changing page while a pad is held
-            # cannot make one pad's release land on another.
-            step = self._step_offset + index
-            if step < self._pattern_length():
-                self._pressed_steps[step] = time.time()
-                return True
-
-        return False
+        cell = self._pad_to_cell(note)
+        if cell is None:
+            return False
+        col, row = cell
+        step = self._step_offset + col
+        index = self._keymap_index(row)
+        if step >= self._pattern_length() or not 0 <= index < len(self._keymap):
+            return False
+        # Keyed by the pad note, and carrying the step and keymap row resolved
+        # at press time: the step window can move under a held pad, and the
+        # release must still act on the cell that was pressed.
+        self._pressed_cells[note] = (time.time(), step, index)
+        return True
 
     def note_off(self, note, shifted_override=None):
-        col, row = self._driver.get_note_xy(note)
-
-        if row == SS_ROW_INSTRUMENTS and col < SS_NUM_INSTRUMENTS:
-            # Whether this is the "+" column is decided on press. Learning a
-            # note during the hold moves the page, so re-checking at release
-            # would compare a stale column against a new page and misfire.
-            was_add_column = self._pressed_add_column
-            self._pressed_add_column = False
-            learned = self._added_during_hold
-            self._added_during_hold = False
-            self._held_instrument = None
-            self._ui_clear_note()
-            self._disable_midi_listening()
-            # Releasing "+" with nothing learned during the hold assigns the
-            # next free note, so an instrument can be added with no second
-            # device.
-            if was_add_column and not learned:
-                self._assign_next_instrument()
+        cell = self._pad_to_cell(note)
+        if cell is None:
+            return False
+        pressed = self._pressed_cells.pop(note, None)
+        if pressed is None:
             return True
-
-        index = self._note_to_step(note)
-        if index is not None:
-            step = self._step_offset + index
-            pressed_at = self._pressed_steps.pop(step, None)
-            if pressed_at is not None and step < self._pattern_length():
-                if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
-                    self._restrike_step(step)
-                else:
-                    self._toggle_step(step)
+        pressed_at, step, index = pressed
+        if step >= self._pattern_length() or not 0 <= index < len(self._keymap):
             return True
-
-        return False
+        if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
+            # A long press selects the note instead of toggling it.
+            self._select_cell(step, index)
+        else:
+            self._toggle_note(step, index)
+        return True
 
     def cc_change(self, ccnum, ccval):
         if ccval <= 0:
             return True
-        # Arrow cluster: Up/Down move the 16-step window, Left/Right page the
-        # instrument row. BACK moved from the up arrow to Capture MIDI because
-        # paging needs it; sending BACK flips the screen, which flips the driver
-        # back to launcher mode.
+        # Arrow cluster: Up/Down move the cursor between instruments, and the
+        # window follows it. Left/Right move the step window. BACK lives on
+        # Capture MIDI because the arrows are needed for navigation; sending
+        # BACK flips the screen, which flips the driver back to launcher mode.
         if ccnum == 0x5B:
-            self._set_step_page(self._step_offset - SS_NUM_STEPS)
+            self._select_row(self._selected_row + 1)
             return True
         if ccnum == 0x5C:
-            self._set_step_page(self._step_offset + SS_NUM_STEPS)
+            self._select_row(self._selected_row - 1)
+            return True
+        if ccnum == 0x5D:
+            self._set_step_offset(self._step_offset - SS_NUM_COLS)
+            return True
+        if ccnum == 0x5E:
+            self._set_step_offset(self._step_offset + SS_NUM_COLS)
             return True
         if ccnum == CC_CAPTURE:
             self._state_manager.send_cuia("BACK")
             return True
-        if ccnum == 0x5D:
-            self._set_instrument_page(
-                self._instrument_offset - SS_NUM_INSTRUMENTS)
-            return True
-        if ccnum == 0x5E:
-            self._set_instrument_page(
-                self._instrument_offset + SS_NUM_INSTRUMENTS)
-            return True
-        # Right column, top button toggles playback.
-        col, row = self._driver.get_note_xy(ccnum)
-        if col == 8 and row == 0:
+        # The control strip down the right-hand side.
+        if ccnum == CC_TRANSPORT:
             self._toggle_play()
+            return True
+        for index, brush_cc in enumerate(SS_VELOCITY_CCS):
+            if ccnum == brush_cc:
+                self._set_brush(index)
+                return True
         return True
+
+    def _set_brush(self, level):
+        self._brush = level
+        self._save_selection()
+        self._render_controls()
+
+    def _select_cell(self, step, index):
+        """Move the cursor to a cell and show it on the touchscreen too."""
+        self._selected_step = step
+        self._selected_row = index
+        self._scroll_row_window()
+        self._sync_screen()
+        self._render_grid()
 
     # ----- on-screen pattern editor ---------------------------------------
     #
-    # Mirrors the pad's instrument selection onto the touchscreen, so the two do
-    # not disagree about which note is being edited. This reaches into the GUI
-    # directly, which the Zynthian codebase already does from ModeHandlerBase
-    # (_get_selected_step) and from the Launchpad Pro MK2 driver. Every call is
-    # best-effort: the driver must keep working if the screen is elsewhere, if
-    # the note is not in the chain's keymap, or if the UI changes shape.
+    # The pad and the screen are two views of the same piano roll, so the
+    # driver only has to tell the screen where the cursor is. This reaches
+    # into the GUI directly, which the Zynthian codebase already does from
+    # ModeHandlerBase (_get_selected_step) and from the Launchpad Pro MK2
+    # driver. Every call is best-effort: the driver must keep working if the
+    # screen is elsewhere or if the UI changes shape.
 
     def _pattern_editor(self):
         """The on-screen pattern editor, or None when it is not the current screen."""
@@ -823,71 +652,6 @@ class StepSeqHandler(ModeHandlerBase):
         except Exception as ex:
             logging.debug(f"Launchpad X pattern editor unavailable: {ex}")
             return None
-
-    def _ui_select_note(self, note):
-        """Scroll the pattern editor to `note`, select it and highlight it.
-
-        The editor addresses notes by row, resolved through the chain's keymap,
-        so a note the patch does not map simply has no row: that is ignored
-        rather than treated as a failure.
-        """
-        pe = self._pattern_editor()
-        if pe is None or note is None:
-            return False
-        try:
-            row = pe.get_row_from_note(note)
-            if row is None:
-                return False
-            pe.pianoroll_note_on(note)
-            # pianoroll_note_on only moves the selection when the row is off
-            # screen, so select explicitly to keep the two in step either way.
-            pe.select_cell(None, row)
-            self._ui_note = note
-            return True
-        except Exception as ex:
-            logging.error(f"Launchpad X could not update the pattern editor: {ex}")
-            return False
-
-    def _ui_clear_note(self):
-        """Withdraw the highlight left by _ui_select_note."""
-        if self._ui_note is None:
-            return False
-        note = self._ui_note
-        self._ui_note = None
-        pe = self._pattern_editor()
-        if pe is None:
-            return False
-        try:
-            pe.pianoroll_note_off(note)
-            return True
-        except Exception as ex:
-            logging.error(f"Launchpad X could not clear the pattern editor: {ex}")
-            return False
-
-    def _select_instrument(self, index):
-        self._selected_note_pad = index
-        self._enable_midi_listening()
-        # Withdraw any highlight from a previous selection first, so moving
-        # between instruments does not leave the old one lit on the screen.
-        self._ui_clear_note()
-        note_pad = self._selected_note
-        if note_pad is not None:
-            self._ui_select_note(note_pad["note"])
-            self._note_player.play(
-                note_pad["note"], self._brush_velocity,
-                note_pad["duration"], self._chain_midi_chan())
-        self._save_selection()
-        self.refresh()
-
-    def _set_brush(self, level):
-        self._brush = level
-        note_pad = self._selected_note
-        if note_pad is not None:
-            self._note_player.play(
-                note_pad["note"], self._brush_velocity,
-                note_pad["duration"], self._chain_midi_chan())
-        self._save_selection()
-        self.refresh()
 
     def _mark_pattern_changed(self):
         """Tell the pattern editor its pattern was edited, so undo can see it.
@@ -914,35 +678,17 @@ class StepSeqHandler(ModeHandlerBase):
 
     # ----- sequencer operations -----------------------------------------
 
-    def _toggle_step(self, step):
-        note_pad = self._selected_note
-        if note_pad is None:
-            return
-        note = note_pad["note"]
+    def _toggle_note(self, step, index):
+        """Create or remove the note in a cell."""
+        note = self._keymap[index]["note"]
         if self._libseq.getNoteStart(step, note) == -1:
-            self._libseq.addNote(
-                step, note, self._brush_velocity, note_pad["duration"], 0)
+            self._libseq.addNote(step, note, self._brush_velocity, 1.0, 0)
             self._note_player.play(
-                note, self._brush_velocity, note_pad["duration"],
-                self._chain_midi_chan())
+                note, self._brush_velocity, 1.0, self._chain_midi_chan())
         else:
             self._libseq.removeNote(step, note)
         self._mark_pattern_changed()
-        self._render_steps()
-
-    def _restrike_step(self, step):
-        note_pad = self._selected_note
-        if note_pad is None:
-            return
-        note = note_pad["note"]
-        if self._libseq.getNoteStart(step, note) == -1:
-            return
-        velocity = self._brush_velocity
-        self._libseq.setNoteVelocity(step, note, velocity)
-        self._mark_pattern_changed()
-        self._note_player.play(
-            note, velocity, note_pad["duration"], self._chain_midi_chan())
-        self._render_steps()
+        self._render_grid()
 
     def _toggle_play(self):
         self._libseq.togglePlayState(
@@ -959,41 +705,6 @@ class StepSeqHandler(ModeHandlerBase):
         return self._libseq.getPlayState(
             self._zynseq.scene, self._selected_seq[0], self._selected_seq[1]) != zynseq.SEQ_STOPPED
 
-    # ----- MIDI learn ----------------------------------------------------
-
-    def _enable_midi_listening(self):
-        zynsigman.register(zynsigman.S_MIDI, zynsigman.SS_MIDI_NOTE_ON, self._on_midi_note_on)
-
-    def _disable_midi_listening(self):
-        zynsigman.unregister(zynsigman.S_MIDI, zynsigman.SS_MIDI_NOTE_ON, self._on_midi_note_on)
-
-    def _on_midi_note_on(self, izmip, chan, note, vel):
-        # Capture a note played on another device while an instrument pad is held.
-        if self._held_instrument is None or izmip == self._own_device_id:
-            return
-        if izmip >= self._state_manager.get_zmip_seq_index():
-            return
-        # Additions go on the end of the list rather than into a fixed slot,
-        # because slot positions move once the row pages.
-        if not self._add_instrument(note, vel, 1.0):
-            # Already known - just move the selection to it.
-            self._select_note(note)
-            return
-        self._added_during_hold = True
-        # Additions go on the end of the list rather than into a fixed slot,
-        # because slot positions move once the row pages.
-        self._reveal_new_instrument()
-
-    def _select_note(self, note):
-        """Select a note already present in the list, if it is on the current page."""
-        items = self._instrument_list()
-        for col in range(SS_NUM_INSTRUMENTS):
-            position = self._instrument_offset + col
-            if position < len(items) and items[position]["note"] == note:
-                self._select_instrument(col)
-                return True
-        return False
-
     # ----- external state ------------------------------------------------
 
     def update_seq_state(self, phrase, chan, state=None, mode=None, group=None):
@@ -1007,55 +718,24 @@ class StepSeqHandler(ModeHandlerBase):
 
     def refresh(self):
         self.control_off()
-        self._render_instruments()
-        self._render_velocity_lane()
-        self._render_steps()
-        self._render_transport()
+        self._render_grid()
+        self._render_controls()
 
     def control_off(self):
         # Launcher mode paints the grid straight through lib_zyncore, bypassing
         # this LED layer, so those pads are untracked here and would survive a
-        # mode switch. The stepsequencer only paints rows 0-3, so anything the
-        # launcher left in rows 4-7 has to be cleared explicitly.
+        # mode switch. The whole grid has to be cleared explicitly.
         for row in range(8):
             for col in range(8):
                 self._leds.pad_off(self._driver.get_note_from_xy(col, row))
-        for ccnum in (89, 79, 69, 59, 49, 39, 29, 19):
+        for ccnum in SS_RIGHT_COL_CCS:
             self._leds.cc_off(ccnum)
         for arrow in (0x5B, 0x5C, 0x5D, 0x5E):
             self._leds.cc_off(arrow)
         self._leds.cc_off(CC_CAPTURE)
 
-    def _render_instruments(self):
-        items = self._instrument_list()
-        count = len(items)
-        for col in range(SS_NUM_INSTRUMENTS):
-            note = self._instrument_pad(col)
-            position = self._instrument_offset + col
-            if position < count:
-                if col == self._selected_note_pad:
-                    self._leds.pad_on(note, COLORS.INSTRUMENT_SELECTED, 2)
-                else:
-                    self._leds.pad_on(note, COLORS.INSTRUMENT)
-            elif position == count and self._instrument_offset + SS_NUM_INSTRUMENTS >= count:
-                # "+" slot, in the first column after the final instrument.
-                self._leds.pad_on(note, COLORS.INSTRUMENT_ADD, 2)
-            else:
-                # Dim rather than off. An empty slot is information the player
-                # needs, and a black pad is indistinguishable from a grid that
-                # was never painted.
-                self._leds.pad_on(note, COLORS.INSTRUMENT_EMPTY)
-
-    def _render_velocity_lane(self):
-        for index in range(SS_NUM_VELOCITIES):
-            note = self._velocity_pad(index)
-            if index == self._brush:
-                self._leds.pad_on(note, COLORS.VELOCITY_LANE_SELECTED, 2)
-            else:
-                self._leds.pad_off(note)
-
     def _step_velocity_level(self, step, note):
-        """Map a stored step velocity back onto the nearest lane level."""
+        """Map a stored step velocity back onto the nearest brush level."""
         velocity = self._libseq.getNoteVelocity(step, note)
         best, best_delta = 0, None
         for level, value in enumerate(SS_VELOCITY_VALUES):
@@ -1064,36 +744,47 @@ class StepSeqHandler(ModeHandlerBase):
                 best, best_delta = level, delta
         return best
 
-    def _render_steps(self):
-        note_pad = self._selected_note
+    def _render_grid(self):
+        """Draw the piano roll: a note per cell, coloured by its velocity."""
         length = self._pattern_length()
-        for index in range(SS_NUM_STEPS):
-            note = self._step_pad(index)
-            step = self._step_offset + index
-            if step >= length:
-                self._leds.pad_off(note)
-                continue
-            # The playhead wins over everything, including empty steps, so the
-            # current position stays visible even with sparse patterns. It is
-            # drawn only while it is inside the window: the window never chases
-            # the playhead, so on a long pattern it simply leaves the view.
-            if step == self._playhead_step:
-                self._leds.pad_on(note, COLORS.PLAYHEAD, 2)
-                continue
-            if note_pad is None or self._libseq.getNoteStart(step, note_pad["note"]) == -1:
-                # Absolute step, so beats still line up across a page boundary -
-                # 16 is a multiple of 4.
-                if step % 4 == 0:
-                    self._leds.pad_on(note, COLORS.BEAT_MARKER)
-                else:
-                    self._leds.pad_off(note)
-                continue
-            level = self._step_velocity_level(step, note_pad["note"])
-            self._leds.pad_on(note, COLORS.VELOCITY_STEP[level])
+        for row in range(SS_NUM_ROWS):
+            index = self._keymap_index(row)
+            selected = index == self._selected_row
+            for col in range(SS_NUM_COLS):
+                pad = self._cell_pad(col, row)
+                step = self._step_offset + col
+                if not 0 <= index < len(self._keymap) or step >= length:
+                    self._leds.pad_off(pad)
+                    continue
+                note = self._keymap[index]["note"]
+                # The playhead is a column, drawn over everything in it, the
+                # way the touchscreen draws its cursor.
+                if step == self._playhead_step:
+                    self._leds.pad_on(pad, COLORS.PLAYHEAD, 2)
+                    continue
+                if self._libseq.getNoteStart(step, note) == -1:
+                    # An empty cell on a downbeat is marked, so the beat grid
+                    # is readable at a glance.
+                    if step % SS_BEAT_DIVISION == 0:
+                        self._leds.pad_on(pad, COLORS.BEAT_MARKER)
+                    else:
+                        self._leds.pad_off(pad)
+                    continue
+                level = self._step_velocity_level(step, note)
+                # The selected instrument's row pulses, so the cursor is
+                # obvious without hiding the note colours.
+                self._leds.pad_on(
+                    pad, COLORS.VELOCITY_STEP[level], 2 if selected else 0)
 
-    def _render_transport(self):
+    def _render_controls(self):
+        """Draw the control strip: transport and the velocity brush."""
         colour = COLORS.TRANSPORT_ACTIVE if self._is_playing else COLORS.TRANSPORT
-        self._leds.cc_on(89, colour, 2 if self._is_playing else 0)
+        self._leds.cc_on(CC_TRANSPORT, colour, 2 if self._is_playing else 0)
+        for index, ccnum in enumerate(SS_VELOCITY_CCS):
+            if index == self._brush:
+                self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE_SELECTED, 2)
+            else:
+                self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE)
 
     def _update_playhead(self):
         """Called from the playhead monitor thread."""
@@ -1116,7 +807,16 @@ class StepSeqHandler(ModeHandlerBase):
                     new_step = index if index < self._pattern_length() else None
             if new_step != self._playhead_step:
                 self._playhead_step = new_step
-                self._render_steps()
+                # The window follows the playhead while the pattern plays, so
+                # the playhead never leaves the view. When it stops, the window
+                # stays where the playhead left it.
+                if new_step is not None:
+                    if new_step < self._step_offset or \
+                            new_step >= self._step_offset + SS_NUM_COLS:
+                        self._step_offset = max(
+                            0, min(new_step - SS_NUM_COLS + 1,
+                                   self._max_step_offset()))
+                self._render_grid()
         except Exception as ex:
             logging.error(f"Launchpad X playhead update error: {ex}")
 
@@ -1126,7 +826,7 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
 
     dev_ids = ["Launchpad X IN 1"]
     driver_name = "Launchpad X"
-    driver_description = "Launcher + arrow keys + step sequencer"
+    driver_description = "Launcher + piano roll step sequencer"
 
     def __init__(self, state_manager, idev_in, idev_out=None):
         super().__init__(state_manager, idev_in, idev_out)
@@ -1189,9 +889,9 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             if self._mode == MODE_STEPSEQ and self._stepseq is not None:
                 # Already in stepseq mode, so set_mode() returns early. The player
                 # can switch patterns without ever leaving the Pattern Editor, so
-                # refresh the instruments explicitly rather than showing the
-                # previous pattern's.
-                self._stepseq.rescan_instruments()
+                # reload the keymap and repaint rather than showing the previous
+                # pattern's instruments.
+                self._stepseq._load_keymap()
                 self._stepseq.refresh()
             else:
                 self.set_mode(MODE_STEPSEQ)
