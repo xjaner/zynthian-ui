@@ -196,10 +196,23 @@ class StepSeqState:
         return chain
 
     def get_selection_by_sequence(self, seq):
-        return self._seqs.get(seq, [0, SS_VELOCITY_DEFAULT])
+        """The saved cursor position and brush for a sequence.
 
-    def set_selection_by_sequence(self, seq, pad, brush):
-        self._seqs[seq] = [pad, brush]
+        The cursor row is remembered per sequence so that re-entering the
+        pattern editor lands where it was left. For a melodic chain, whose
+        keymap runs to well over a hundred rows, having to scroll back to the
+        same place every time is worse than the editing itself.
+        """
+        value = self._seqs.get(seq)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            # Older revisions stored [instrument_column, brush].
+            return {"row": value[0], "brush": value[1], "offset": 0}
+        return {"row": 0, "brush": SS_VELOCITY_DEFAULT, "offset": 0}
+
+    def set_selection_by_sequence(self, seq, row, brush, offset=0):
+        self._seqs[seq] = {"row": row, "brush": brush, "offset": offset}
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -500,6 +513,9 @@ class StepSeqHandler(ModeHandlerBase):
             self.refresh()
         else:
             self._playhead.set_enabled(False)
+            # Leaving the editor: remember the cursor, so that coming back to
+            # this pattern lands in the same place.
+            self._save_selection()
             self._leds.all_off()
 
     # ----- state ---------------------------------------------------------
@@ -526,14 +542,21 @@ class StepSeqHandler(ModeHandlerBase):
         chain = self._saved_state.get_chain(self._chain_id)
         brush = chain.get("brush", SS_VELOCITY_DEFAULT)
         self._brush = brush if 0 <= brush < SS_NUM_VELOCITIES else SS_VELOCITY_DEFAULT
-        self._row_offset = 0
+        # The cursor position and the window are remembered per sequence, so
+        # re-entering the pattern editor lands where it was left.
+        selection = self._saved_state.get_selection_by_sequence(
+            phrase * 256 + chan)
+        self._selected_row = selection.get("row", 0)
+        self._row_offset = selection.get("offset", 0)
         self._step_offset = 0
-        self._selected_row = 0
         self._selected_step = 0
         self._load_keymap()
 
     def _save_selection(self):
         self._saved_state.get_chain(self._chain_id)["brush"] = self._brush
+        self._saved_state.set_selection_by_sequence(
+            self._selected_seq[0] * 256 + self._selected_seq[1],
+            self._selected_row, self._brush, self._row_offset)
 
     def _load_keymap(self):
         """Read the chain's keymap from the pattern editor.
@@ -641,6 +664,9 @@ class StepSeqHandler(ModeHandlerBase):
         self._selected_row = max(0, min(row, len(self._keymap) - 1))
         self._scroll_row_window()
         self._sync_screen()
+        # Remember where the cursor is, so coming back to this pattern lands
+        # here rather than at the top.
+        self._save_selection()
         self._render_grid()
 
     def _sync_screen(self):
@@ -1030,6 +1056,9 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         # True while the device is in its Note layout and the pad is being
         # played rather than used to launch patterns.
         self._note_mode = False
+        # Launcher pad presses in flight, so a long press can be told from a
+        # tap. The launcher path used to look at note-on only.
+        self._launcher_presses = {}
 
     def send_sysex(self, data):
         if self.idev_out is not None:
@@ -1277,6 +1306,47 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             logging.debug(f"Launchpad X could not find the active chain: {ex}")
         return None
 
+    def _launcher_note_off(self, note):
+        """A long press on a launcher pad opens that pattern's editor.
+
+        The launcher grid already says which pattern is under which pad: the
+        column is the chain and the row is the phrase. The pattern is also
+        launched by the press, so this both starts it and opens it for
+        editing, the way a modified click does in a DAW.
+        """
+        pressed_at = self._launcher_presses.pop(note, None)
+        if pressed_at is None:
+            return False
+        if time.time() - pressed_at < SS_LONG_PRESS_TIME:
+            return False
+        col, row = self.get_note_xy(note)
+        if col >= self.cols:
+            return False
+        midi_chan = self.get_filtered_midi_chan_by_index(col)
+        if midi_chan is None:
+            return False
+        self._open_pattern_editor(row + self.scroll_v, midi_chan)
+        return True
+
+    def _open_pattern_editor(self, phrase, midi_chan):
+        """Open the pattern editor on a given pattern.
+
+        ModeHandlerBase._show_pattern_editor() selects the phrase and the
+        chain - which is what sets the sequence the editor will edit - and
+        then loads the pattern.
+        """
+        if self._stepseq is None:
+            return False
+        try:
+            self._stepseq._show_pattern_editor((phrase, midi_chan))
+            logging.info(
+                f"Launchpad X opening the pattern editor on phrase {phrase}, "
+                f"channel {midi_chan}")
+            return True
+        except Exception as ex:
+            logging.error(f"Launchpad X could not open the pattern editor: {ex}")
+            return False
+
     def _note_mode_midi_event(self, ev, evtype):
         """Forward the pad's notes to the chain, so the pad can be played."""
         if evtype not in (0x9, 0x8):
@@ -1317,6 +1387,7 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             note = ev[1] & 0x7F
             vel = ev[2] & 0x7F
             if vel > 0:
+                self._launcher_presses[note] = time.time()
                 col, row = self.get_note_xy(note)
                 midi_chan = self.get_filtered_midi_chan_by_index(col)
                 if midi_chan is not None:
@@ -1325,6 +1396,13 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
                         self.zynseq.libseq.togglePlayState(self.zynseq.scene, phrase, midi_chan)
                     except:
                         pass
+            else:
+                # Note OFF with no velocity: the pad was released.
+                self._launcher_note_off(note)
+            return True
+        # Note OFF => a long press on a launcher pad opens its pattern editor
+        if evtype == 0x8:
+            self._launcher_note_off(ev[1] & 0x7F)
             return True
         # CC => arrows & phrases
         elif evtype == 0xB:
