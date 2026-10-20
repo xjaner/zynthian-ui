@@ -327,6 +327,24 @@ class FeedbackLEDs:
     def cc_off(self, ccnum):
         self.cc_on(ccnum, COLORS.OFF, 0)
 
+    def force_off(self, notes=(), ccs=()):
+        """Turn pads and CCs off unconditionally, ignoring the tracked state.
+
+        The tracked state only knows what THIS layer lit. Launcher mode paints
+        through lib_zyncore, so the device can be showing pads that the cache
+        believes are already off - and the ordinary pad_off() would then
+        suppress the send and leave the launcher's colours lit.
+        """
+        with self._lock:
+            for note in notes:
+                self._pads[note] = (COLORS.OFF, 0)
+            for ccnum in ccs:
+                self._ccs[ccnum] = (COLORS.OFF, 0)
+        for note in notes:
+            self._driver.send_led_note(note, COLORS.OFF, 0)
+        for ccnum in ccs:
+            self._driver.send_led_cc(ccnum, COLORS.OFF, 0)
+
     def all_off(self):
         with self._lock:
             pads, ccs = list(self._pads), list(self._ccs)
@@ -520,8 +538,18 @@ class StepSeqHandler(ModeHandlerBase):
         self._row_offset = max(0, min(self._row_offset, self._max_row_offset()))
 
     def _max_step_offset(self):
-        """Highest step offset that still shows a step."""
-        return max(0, self._pattern_length() - SS_NUM_COLS)
+        """Highest step offset that still shows a step.
+
+        The window is page-aligned: it shows SS_NUM_COLS steps at a time and
+        moves a whole page at a time, so the grid only repaints at a page
+        boundary and the playhead sweeps across within a page. Sliding the
+        window continuously was tried and was worse - everything in the grid
+        was in motion, which made it hard to follow.
+        """
+        length = self._pattern_length()
+        if length <= SS_NUM_COLS:
+            return 0
+        return ((length - 1) // SS_NUM_COLS) * SS_NUM_COLS
 
     def _set_step_offset(self, offset):
         """Move the step window. Clamped, so the arrows are safe to mash."""
@@ -724,12 +752,12 @@ class StepSeqHandler(ModeHandlerBase):
     def control_off(self):
         # Launcher mode paints the grid straight through lib_zyncore, bypassing
         # this LED layer, so those pads are untracked here and would survive a
-        # mode switch. The whole grid has to be cleared explicitly.
-        for row in range(8):
-            for col in range(8):
-                self._leds.pad_off(self._driver.get_note_from_xy(col, row))
-        for ccnum in SS_RIGHT_COL_CCS:
-            self._leds.cc_off(ccnum)
+        # mode switch. The whole grid has to be cleared explicitly, and
+        # unconditionally: the tracked state cannot be trusted to know that
+        # they are already off.
+        notes = [self._driver.get_note_from_xy(col, row)
+                 for row in range(8) for col in range(8)]
+        self._leds.force_off(notes, SS_RIGHT_COL_CCS)
         for arrow in (0x5B, 0x5C, 0x5D, 0x5E):
             self._leds.cc_off(arrow)
         self._leds.cc_off(CC_CAPTURE)
@@ -807,15 +835,14 @@ class StepSeqHandler(ModeHandlerBase):
                     new_step = index if index < self._pattern_length() else None
             if new_step != self._playhead_step:
                 self._playhead_step = new_step
-                # The window follows the playhead while the pattern plays, so
-                # the playhead never leaves the view. When it stops, the window
-                # stays where the playhead left it.
+                # The window follows the playhead a page at a time, so within
+                # a page only the playhead column moves and the grid is still.
+                # When it stops, the window stays where the playhead left it.
                 if new_step is not None:
-                    if new_step < self._step_offset or \
-                            new_step >= self._step_offset + SS_NUM_COLS:
+                    page = (new_step // SS_NUM_COLS) * SS_NUM_COLS
+                    if page != self._step_offset:
                         self._step_offset = max(
-                            0, min(new_step - SS_NUM_COLS + 1,
-                                   self._max_step_offset()))
+                            0, min(page, self._max_step_offset()))
                 self._render_grid()
         except Exception as ex:
             logging.error(f"Launchpad X playhead update error: {ex}")
