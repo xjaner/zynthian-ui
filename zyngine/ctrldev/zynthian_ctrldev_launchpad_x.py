@@ -103,6 +103,11 @@ SS_VELOCITY_CCS = SS_RIGHT_COL_CCS[1:6]
 # Above it => long press, which selects the note instead of toggling it.
 SS_LONG_PRESS_TIME = 0.5
 
+# A long press followed by a pad press within this many seconds is read as a
+# drag: the note is extended to cover the new step. A deliberate press of a
+# second pad is far slower than this, so it stays a separate press.
+SS_EXTEND_WINDOW = 0.25
+
 # Discrete velocity levels offered by the brush, ordered LOW -> HIGH.
 # A new note is created at the selected level.
 SS_VELOCITY_VALUES = [25, 50, 75, 100, 127]
@@ -135,6 +140,11 @@ class COLORS:
     OFF = 0
     # Bright overlay for the column currently under the playhead.
     PLAYHEAD = 3
+    # The steps a long note runs through after its first. A dimmer, neutral
+    # tone, so a note that spans several steps reads as one note rather than
+    # several - and stays distinct from the velocity ramp, which is all green
+    # to white.
+    NOTE_TAIL = 2
     # Velocity brush buttons (right column)
     VELOCITY_LANE = 18
     VELOCITY_LANE_SELECTED = 3
@@ -406,6 +416,9 @@ class StepSeqHandler(ModeHandlerBase):
         # Presses in flight, keyed by the pad note so that a window moving
         # under a held pad cannot make the release land on the wrong cell.
         self._pressed_cells = {}
+        # Set by a long press: the note that may be extended by a drag, and
+        # when the press happened. None when no drag is pending.
+        self._pending_extend = None
         self._playhead_step = None
         self._is_playing = False
 
@@ -592,7 +605,20 @@ class StepSeqHandler(ModeHandlerBase):
         step = self._step_offset + col
         index = self._keymap_index(row)
         if step >= self._pattern_length() or not 0 <= index < len(self._keymap):
+            self._pending_extend = None
             return False
+        # A long press followed straight away by a press on a DIFFERENT step of
+        # the same row is a drag: the note is extended to cover the new step
+        # rather than a new note being created there. Pressing the same cell
+        # again is a second tap, not a drag, and is left alone.
+        if self._pending_extend is not None:
+            pending = self._pending_extend
+            self._pending_extend = None
+            elapsed = time.time() - pending["time"]
+            if (pending["index"] == index and pending["step"] != step
+                    and 0 <= elapsed <= SS_EXTEND_WINDOW):
+                self._extend_note(pending, step)
+                return True
         # Keyed by the pad note, and carrying the step and keymap row resolved
         # at press time: the step window can move under a held pad, and the
         # release must still act on the cell that was pressed.
@@ -610,7 +636,19 @@ class StepSeqHandler(ModeHandlerBase):
         if step >= self._pattern_length() or not 0 <= index < len(self._keymap):
             return True
         if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
-            # A long press selects the note instead of toggling it.
+            # A long press selects the note instead of toggling it, and arms
+            # it for extension: a press in the same row straight afterwards is
+            # read as a drag and lengthens the note.
+            note_number = self._keymap[index]["note"]
+            start = self._libseq.getNoteStart(step, note_number)
+            if start >= 0:
+                self._pending_extend = {
+                    "start": start,
+                    "note": note_number,
+                    "index": index,
+                    "step": step,
+                    "time": time.time(),
+                }
             self._select_cell(step, index)
         else:
             self._toggle_note(step, index)
@@ -709,14 +747,46 @@ class StepSeqHandler(ModeHandlerBase):
     def _toggle_note(self, step, index):
         """Create or remove the note in a cell."""
         note = self._keymap[index]["note"]
-        if self._libseq.getNoteStart(step, note) == -1:
+        start = self._libseq.getNoteStart(step, note)
+        if start == -1:
             self._libseq.addNote(step, note, self._brush_velocity, 1.0, 0)
             self._note_player.play(
                 note, self._brush_velocity, 1.0, self._chain_midi_chan())
         else:
-            self._libseq.removeNote(step, note)
+            # A note that is longer than a step covers several cells, so it is
+            # removed from where it starts - removing by the cell that was
+            # tapped would find nothing and leave the note in place.
+            self._libseq.removeNote(start, note)
         self._mark_pattern_changed()
         self._render_grid()
+
+    def _extend_note(self, pending, new_step):
+        """Lengthen or shorten a note so that it reaches `new_step`.
+
+        The note is removed and re-added with the new duration, because libseq
+        has no call to change a note's length in place. That loses any
+        per-note extras such as stutter or play chance, which a note created
+        here never had.
+        """
+        start = pending["start"]
+        note = pending["note"]
+        duration = max(1, new_step - start + 1)
+        # Never reach past the end of the pattern.
+        duration = min(duration, max(1, self._pattern_length() - start))
+        # Never run over another note of the same pitch: the on-screen editor
+        # does not allow that, and the two must agree.
+        for step in range(start + 1, start + duration):
+            if self._libseq.getNoteStart(step, note) == step:
+                duration = step - start
+                break
+        if duration <= 0:
+            return False
+        velocity = self._libseq.getNoteVelocity(start, note)
+        self._libseq.removeNote(start, note)
+        self._libseq.addNote(start, note, velocity, float(duration), 0)
+        self._mark_pattern_changed()
+        self._render_grid()
+        return True
 
     def _toggle_play(self):
         self._libseq.togglePlayState(
@@ -790,7 +860,11 @@ class StepSeqHandler(ModeHandlerBase):
                 if step == self._playhead_step:
                     self._leds.pad_on(pad, COLORS.PLAYHEAD, 2)
                     continue
-                if self._libseq.getNoteStart(step, note) == -1:
+                # getNoteStart returns the step a note covering this cell
+                # starts at, so a note longer than a step shows its first
+                # step lit and the rest as a tail.
+                start = self._libseq.getNoteStart(step, note)
+                if start == -1:
                     # An empty cell on a downbeat is marked, so the beat grid
                     # is readable at a glance.
                     if step % SS_BEAT_DIVISION == 0:
@@ -798,11 +872,14 @@ class StepSeqHandler(ModeHandlerBase):
                     else:
                         self._leds.pad_off(pad)
                     continue
-                level = self._step_velocity_level(step, note)
                 # The selected instrument's row pulses, so the cursor is
                 # obvious without hiding the note colours.
-                self._leds.pad_on(
-                    pad, COLORS.VELOCITY_STEP[level], 2 if selected else 0)
+                channel = 2 if selected else 0
+                if start == step:
+                    level = self._step_velocity_level(step, note)
+                    self._leds.pad_on(pad, COLORS.VELOCITY_STEP[level], channel)
+                else:
+                    self._leds.pad_on(pad, COLORS.NOTE_TAIL, channel)
 
     def _render_controls(self):
         """Draw the control strip: transport and the velocity brush."""
