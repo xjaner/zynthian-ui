@@ -24,6 +24,68 @@
 #
 # ******************************************************************************
 
+"""Novation Launchpad X driver: clip launcher, piano-roll step sequencer and keyboard.
+
+The device runs in its DAW mode, Session layout. The driver has three modes.
+The on-screen Pattern Editor decides which one is active: the step sequencer
+runs while the editor is the current screen, and the launcher runs otherwise.
+
+Launcher
+    Grid pads      Tap to launch or stop a sequence: the column is the chain
+                   and the row is the phrase, both following the launcher's
+                   scroll. A long press (0.5 s) also opens that pattern in
+                   the Pattern Editor.
+    Right column   Launch or stop a whole phrase.
+    Arrows         Sent as ARROW_UP/DOWN/LEFT/RIGHT to the Zynthian UI.
+    Note           Note mode (below).
+
+Note mode
+    The device shows its own Note layout. Pads play the active chain, with
+    pressure. Each note's MIDI channel is fixed at note-on, so a note-off
+    still reaches the right chain if the active chain changes. Session goes
+    back to the launcher.
+
+Step sequencer (Pattern Editor open)
+    The grid mirrors the screen's piano roll. Each row is one note of the
+    chain's keymap, with the highest note on the top row, and each column is
+    one step, so 8 notes x 8 steps are visible.
+
+    Grid pads      Tap: add a note (using the editor's note length, heard
+                   while stopped) or remove the note under the pad.
+                   Long press: select the note, or create one there.
+                   Hold one pad and tap another in the same row: stretch the
+                   held note to reach the tapped pad. Sliding along the row
+                   right after a long press stretches the note the same way.
+    Up / Down      Move the cursor row; hold to repeat. The screen follows.
+    Left / Right   Page through the steps, 8 at a time. While the pattern
+                   plays, the page follows the playhead.
+    Right column   Top: play / stop. Next five: velocity brush, 25 to 127.
+                   Bottom two: unused.
+    Capture MIDI   BACK.
+    Session        Back to the launcher.
+
+    Colours: a note's first step runs from dim green to white with velocity,
+    the rest of a long note is grey, empty first steps of each beat are dim
+    grey, the playhead is a pulsing white column, and the selected row's
+    notes pulse.
+
+Internals
+    StepSeqHandler   The step sequencer. It edits the pattern through libseq
+                     and reads the keymap, the note length and the default
+                     note data from the Pattern Editor screen. It sets the
+                     editor's "changed" flag so that pad edits can be undone.
+    FeedbackLEDs     Caches what each LED shows and only sends changes. The
+                     launcher paints without the cache, so the grid is
+                     cleared in full on entering the step sequencer.
+    PlayheadMonitor  Polls libseq every 15 ms for the playhead and the play
+                     state. Every 7th poll it also checks for a different
+                     pattern, keymap, length or sequence on the screen, and
+                     repaints, so touchscreen edits appear on the pad.
+    ArrowRepeater    Generates the key repeat for held Up/Down arrows.
+    StepSeqState     Saved in the snapshot: the brush per chain, and the
+                     cursor row per sequence.
+"""
+
 import logging
 import time
 from math import ceil
