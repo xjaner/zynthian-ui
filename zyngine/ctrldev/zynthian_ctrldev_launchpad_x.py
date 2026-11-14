@@ -33,8 +33,9 @@ runs while the editor is the current screen, and the launcher runs otherwise.
 Launcher
     Grid pads      Tap to launch or stop a sequence: the column is the chain
                    and the row is the phrase, both following the launcher's
-                   scroll. A long press (0.5 s) also opens that pattern in
-                   the Pattern Editor.
+                   scroll. The tap acts on release. A long press (0.5 s)
+                   opens that pattern in the Pattern Editor instead, without
+                   starting it.
     Right column   Launch or stop a whole phrase.
     Arrows         Sent as ARROW_UP/DOWN/LEFT/RIGHT to the Zynthian UI.
     Note           Note mode (below).
@@ -56,18 +57,24 @@ Step sequencer (Pattern Editor open)
                    Hold one pad and tap another in the same row: stretch the
                    held note to reach the tapped pad. Sliding along the row
                    right after a long press stretches the note the same way.
-    Up / Down      Move the cursor row; hold to repeat. The screen follows.
-    Left / Right   Page through the steps, 8 at a time. While the pattern
-                   plays, the page follows the playhead.
-    Right column   Top: play / stop. Next five: velocity brush, 25 to 127.
-                   Bottom two: unused.
+    Up / Down      Move the cursor row; hold to repeat. The screen follows,
+                   and while stopped the row's note plays.
+    Left / Right   Page through the steps, 8 at a time. Paging by hand
+                   stops the page following the playhead.
+    Right column   1: play / stop.
+                   2-6: velocity brush, 25 to 127, for new notes. Pressed
+                        while note pads are held, it also sets those notes'
+                        velocity.
+                   7: follow the playhead on / off (bright blue when on).
+                   8: tap to undo, long press to redo.
     Capture MIDI   BACK.
     Session        Back to the launcher.
 
     Colours: a note's first step runs from dim green to white with velocity,
-    the rest of a long note is grey, empty first steps of each beat are dim
-    grey, the playhead is a pulsing white column, and the selected row's
-    notes pulse.
+    the rest of a long note is grey, and empty first steps of each beat are
+    dim grey. In the playhead column, notes light white and empty cells are
+    blue. The cursor row's notes pulse and its empty cells are orange. An
+    arrow is lit when there is more to scroll to in its direction.
 
 Internals
     StepSeqHandler   The step sequencer. It edits the pattern through libseq
@@ -161,6 +168,12 @@ SS_BEAT_DIVISION = 4
 SS_RIGHT_COL_CCS = (89, 79, 69, 59, 49, 39, 29, 19)
 CC_TRANSPORT = SS_RIGHT_COL_CCS[0]
 SS_VELOCITY_CCS = SS_RIGHT_COL_CCS[1:6]
+# Button 7 turns following the playhead on and off; button 8 is undo (tap)
+# and redo (long press).
+CC_FOLLOW = SS_RIGHT_COL_CCS[6]
+CC_UNDO = SS_RIGHT_COL_CCS[7]
+# The arrow cluster: Up, Down, Left, Right.
+CC_UP, CC_DOWN, CC_LEFT, CC_RIGHT = 0x5B, 0x5C, 0x5D, 0x5E
 
 # Note-off happens before this many seconds elapse => plain toggle.
 # Above it => long press, which selects the note instead of toggling it.
@@ -210,8 +223,21 @@ class COLORS:
     # Dim marker for the first step of each beat, and for unused pads.
     BEAT_MARKER = 1
     OFF = 0
-    # Bright overlay for the column currently under the playhead.
+    # The playhead column: notes in it light white as they play, and its
+    # empty cells are blue, so the notes stay readable under the playhead.
     PLAYHEAD = 3
+    PLAYHEAD_EMPTY = 46
+    # Empty cells of the cursor's row, so the cursor shows on a row with no
+    # notes. Orange is not used anywhere else in the grid.
+    CURSOR_ROW = 11
+    CURSOR_ROW_BEAT = 10
+    # Arrows, lit when there is more to scroll to, and Capture MIDI (BACK).
+    ARROW = 2
+    BACK = 1
+    # Follow on/off: blue, like the playhead it follows.
+    FOLLOW_ON = 45
+    FOLLOW_OFF = 47
+    UNDO = 6
     # The steps a long note runs through after its first. A dimmer, neutral
     # tone, so a note that spans several steps reads as one note rather than
     # several - and stays distinct from the velocity ramp, which is all green
@@ -518,6 +544,11 @@ class StepSeqHandler(ModeHandlerBase):
         self._drag = None
         self._playhead_step = None
         self._is_playing = False
+        # While True, the step window jumps to the playhead's page as the
+        # pattern plays. A manual page turns it off; button 7 toggles it.
+        self._follow = True
+        # Press time of the undo button, to tell undo (tap) from redo.
+        self._undo_pressed_at = None
         # What the grid was built from, so that a change made on the screen -
         # another pattern, another scale, another length - is noticed.
         self._keymap_src = None
@@ -533,6 +564,8 @@ class StepSeqHandler(ModeHandlerBase):
     def set_active(self, active):
         if active:
             super().set_active(True)
+            self._follow = True
+            self._undo_pressed_at = None
             with self._render_lock:
                 self._load_current_selection()
                 self._refresh_play_state()
@@ -882,23 +915,36 @@ class StepSeqHandler(ModeHandlerBase):
         #
         # Holding an arrow repeats it, so the cursor can be run through a long
         # list of instruments without pressing and releasing for every one.
-        if ccnum in (0x5B, 0x5C):
-            direction = 1 if ccnum == 0x5B else -1
+        if ccnum in (CC_UP, CC_DOWN):
+            direction = 1 if ccnum == CC_UP else -1
             if ccval > 0:
                 self._select_row(self._selected_row + direction)
+                # Play the instrument the cursor landed on, so a sound can be
+                # found by ear. Only on the press: the repeat would be noise.
+                self._audition_selected_row()
                 self._repeater.start_repeat(direction)
             else:
                 self._repeater.stop_repeat()
+            return True
+        # Undo and redo act on release, where the press length is known.
+        if ccnum == CC_UNDO:
+            if ccval > 0:
+                self._undo_pressed_at = time.time()
+            elif self._undo_pressed_at is not None:
+                held = time.time() - self._undo_pressed_at
+                self._undo_pressed_at = None
+                self._undo(redo=held >= SS_LONG_PRESS_TIME)
             return True
         # Everything below acts on the press only: the device sends a CC
         # with value 0 on release, which would otherwise act a second time.
         if ccval <= 0:
             return True
-        if ccnum == 0x5D:
-            self._set_step_offset(self._step_offset - SS_NUM_COLS)
-            return True
-        if ccnum == 0x5E:
-            self._set_step_offset(self._step_offset + SS_NUM_COLS)
+        if ccnum in (CC_LEFT, CC_RIGHT):
+            # Paging by hand means "let me look here": stop following the
+            # playhead, or the next step would snap the window back.
+            self._set_follow(False)
+            delta = SS_NUM_COLS if ccnum == CC_RIGHT else -SS_NUM_COLS
+            self._set_step_offset(self._step_offset + delta)
             return True
         if ccnum == CC_CAPTURE:
             self._state_manager.send_cuia("BACK")
@@ -907,9 +953,15 @@ class StepSeqHandler(ModeHandlerBase):
         if ccnum == CC_TRANSPORT:
             self._toggle_play()
             return True
+        if ccnum == CC_FOLLOW:
+            self._set_follow(not self._follow)
+            return True
         for index, brush_cc in enumerate(SS_VELOCITY_CCS):
             if ccnum == brush_cc:
                 self._set_brush(index)
+                # A brush pressed while note pads are held re-colours those
+                # notes, so a velocity can be changed without re-entering.
+                self._apply_brush_to_held_notes()
                 return True
         return True
 
@@ -924,6 +976,62 @@ class StepSeqHandler(ModeHandlerBase):
         self._brush = level
         self._save_selection()
         self._render_controls()
+
+    def _apply_brush_to_held_notes(self):
+        """Give every note under a held pad the brush's velocity.
+
+        The press is then consumed, so releasing the pad does not toggle the
+        note away. A held empty pad is left alone: its release still enters a
+        note, now at the new velocity.
+        """
+        changed = False
+        for pressed in self._pressed_cells.values():
+            if pressed["consumed"]:
+                continue
+            index = pressed["index"]
+            if not 0 <= index < len(self._keymap):
+                continue
+            note = self._keymap[index]["note"]
+            start = self._libseq.getNoteStart(pressed["step"], note)
+            if start == -1:
+                continue
+            self._libseq.setNoteVelocity(start, note, self._brush_velocity)
+            pressed["consumed"] = True
+            changed = True
+        if changed:
+            self._mark_pattern_changed()
+            self._render_grid()
+
+    def _audition_selected_row(self):
+        if 0 <= self._selected_row < len(self._keymap):
+            self._audition(self._keymap[self._selected_row]["note"], 1.0)
+
+    def _set_follow(self, follow):
+        if follow == self._follow:
+            return
+        self._follow = follow
+        if follow and self._playhead_step is not None:
+            # Catch up with the playhead straight away.
+            self._step_offset = max(0, min(
+                (self._playhead_step // SS_NUM_COLS) * SS_NUM_COLS,
+                self._max_step_offset()))
+            self._render_grid()
+        self._render_controls()
+
+    def _undo(self, redo=False):
+        """Undo or redo through the pattern editor's own snapshot stack, so
+        the pad and the screen share one history."""
+        pe = self._pattern_editor()
+        if pe is None:
+            return
+        try:
+            if redo:
+                pe.redo_pattern()
+            else:
+                pe.undo_pattern()
+        except Exception as ex:
+            logging.error(f"Launchpad X could not {'redo' if redo else 'undo'}: {ex}")
+        self._render_grid()
 
     def _select_cell(self, step, index):
         """Move the cursor to a cell and show it on the touchscreen too."""
@@ -1113,9 +1221,6 @@ class StepSeqHandler(ModeHandlerBase):
                 return
             if force:
                 self.control_off()
-            else:
-                for ccnum in (0x5B, 0x5C, 0x5D, 0x5E, CC_CAPTURE):
-                    self._leds.cc_off(ccnum)
             self._render_grid()
             self._render_controls()
 
@@ -1128,7 +1233,7 @@ class StepSeqHandler(ModeHandlerBase):
         notes = [self._driver.get_note_from_xy(col, row)
                  for row in range(8) for col in range(8)]
         self._leds.force_off(notes, SS_RIGHT_COL_CCS)
-        for arrow in (0x5B, 0x5C, 0x5D, 0x5E):
+        for arrow in (CC_UP, CC_DOWN, CC_LEFT, CC_RIGHT):
             self._leds.cc_off(arrow)
         self._leds.cc_off(CC_CAPTURE)
 
@@ -1159,24 +1264,32 @@ class StepSeqHandler(ModeHandlerBase):
                         self._leds.pad_off(pad)
                         continue
                     note = self._keymap[index]["note"]
-                    # The playhead is a column, drawn over everything in it,
-                    # the way the touchscreen draws its cursor.
-                    if step == self._playhead_step:
-                        self._leds.pad_on(pad, COLORS.PLAYHEAD, 2)
-                        continue
                     # getNoteStart returns the step a note covering this cell
                     # starts at, so a note longer than a step shows its first
                     # step lit and the rest as a tail.
                     start = self._libseq.getNoteStart(step, note)
+                    if step == self._playhead_step:
+                        # The playhead column: notes light white as they
+                        # play, empty cells show the column in blue.
+                        if start == -1:
+                            self._leds.pad_on(pad, COLORS.PLAYHEAD_EMPTY)
+                        else:
+                            self._leds.pad_on(pad, COLORS.PLAYHEAD)
+                        continue
                     if start == -1:
                         # An empty cell on a downbeat is marked, so the beat
-                        # grid is readable at a glance.
-                        if step % steps_per_beat == 0:
+                        # grid is readable at a glance. The cursor's row is
+                        # tinted, so the cursor shows on an empty row too.
+                        downbeat = step % steps_per_beat == 0
+                        if selected:
+                            self._leds.pad_on(pad, COLORS.CURSOR_ROW_BEAT
+                                              if downbeat else COLORS.CURSOR_ROW)
+                        elif downbeat:
                             self._leds.pad_on(pad, COLORS.BEAT_MARKER)
                         else:
                             self._leds.pad_off(pad)
                         continue
-                    # The selected instrument's row pulses, so the cursor is
+                    # The selected instrument's notes pulse, so the cursor is
                     # obvious without hiding the note colours.
                     channel = 2 if selected else 0
                     if start == step:
@@ -1184,9 +1297,30 @@ class StepSeqHandler(ModeHandlerBase):
                         self._leds.pad_on(pad, COLORS.VELOCITY_STEP[level], channel)
                     else:
                         self._leds.pad_on(pad, COLORS.NOTE_TAIL, channel)
+            self._render_arrows()
+
+    def _render_arrows(self):
+        """Light each arrow that has somewhere to go.
+
+        Up and Down light while there are rows above or below the window
+        (the top of the pad shows the highest rows), Left and Right while
+        there is another page of steps.
+        """
+        lit = {
+            CC_UP: self._row_offset < self._max_row_offset(),
+            CC_DOWN: self._row_offset > 0,
+            CC_LEFT: self._step_offset > 0,
+            CC_RIGHT: self._step_offset < self._max_step_offset(),
+        }
+        for ccnum, on in lit.items():
+            if on:
+                self._leds.cc_on(ccnum, COLORS.ARROW)
+            else:
+                self._leds.cc_off(ccnum)
 
     def _render_controls(self):
-        """Draw the control strip: transport and the velocity brush."""
+        """Draw the control strip: transport, the velocity brush, follow and
+        undo, and Capture MIDI as BACK."""
         with self._render_lock:
             if not self._is_active:
                 return
@@ -1197,6 +1331,10 @@ class StepSeqHandler(ModeHandlerBase):
                     self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE_SELECTED, 2)
                 else:
                     self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE)
+            self._leds.cc_on(CC_FOLLOW, COLORS.FOLLOW_ON if self._follow
+                             else COLORS.FOLLOW_OFF)
+            self._leds.cc_on(CC_UNDO, COLORS.UNDO)
+            self._leds.cc_on(CC_CAPTURE, COLORS.BACK)
 
     def _update_playhead(self):
         """Called from the playhead monitor thread."""
@@ -1227,7 +1365,7 @@ class StepSeqHandler(ModeHandlerBase):
                     # within a page only the playhead column moves and the
                     # grid is still. When it stops, the window stays where
                     # the playhead left it.
-                    if new_step is not None:
+                    if new_step is not None and self._follow:
                         page = (new_step // SS_NUM_COLS) * SS_NUM_COLS
                         if page != self._step_offset:
                             self._step_offset = max(
@@ -1523,26 +1661,40 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             logging.debug(f"Launchpad X could not find the active chain: {ex}")
         return None
 
-    def _launcher_note_off(self, note):
-        """A long press on a launcher pad opens that pattern's editor.
+    def _launcher_note_on(self, note):
+        """A launcher pad was pressed. Nothing happens until it is released,
+        when the length of the press says what it meant.
 
-        The launcher grid already says which pattern is under which pad: the
-        column is the chain and the row is the phrase. The pattern is also
-        launched by the press, so this both starts it and opens it for
-        editing, the way a modified click does in a DAW.
+        The pattern is resolved now, so a scroll while the pad is held
+        cannot make the release act on a different pad's pattern.
         """
-        pressed_at = self._launcher_presses.pop(note, None)
-        if pressed_at is None:
-            return False
-        if time.time() - pressed_at < SS_LONG_PRESS_TIME:
-            return False
         col, row = self.get_note_xy(note)
-        if not 0 <= col < self.cols:
-            return False
-        midi_chan = self.get_filtered_midi_chan_by_index(col + self.scroll_h)
+        midi_chan = None
+        if 0 <= col < self.cols:
+            midi_chan = self.get_filtered_midi_chan_by_index(col + self.scroll_h)
         if midi_chan is None:
+            return
+        self._launcher_presses[note] = (time.time(), row + self.scroll_v, midi_chan)
+
+    def _launcher_note_off(self, note):
+        """A launcher pad was released.
+
+        A tap launches or stops the pattern. A long press opens it in the
+        Pattern Editor instead, without starting it. The launcher grid
+        already says which pattern is under which pad: the column is the
+        chain and the row is the phrase.
+        """
+        pressed = self._launcher_presses.pop(note, None)
+        if pressed is None:
             return False
-        self._open_pattern_editor(row + self.scroll_v, midi_chan)
+        pressed_at, phrase, midi_chan = pressed
+        if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
+            self._open_pattern_editor(phrase, midi_chan)
+            return True
+        try:
+            self.zynseq.libseq.togglePlayState(self.zynseq.scene, phrase, midi_chan)
+        except Exception as ex:
+            logging.error(f"Launchpad X could not launch a pattern: {ex}")
         return True
 
     def _open_pattern_editor(self, phrase, midi_chan):
@@ -1619,27 +1771,17 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             return self._stepseq_midi_event(ev, evtype)
         if self._note_mode:
             return self._note_mode_midi_event(ev, evtype)
-        # Note ON => launch/stop sequence
+        # Note ON / OFF => launch or stop a sequence on release, or open its
+        # editor on a long press
         if evtype == 0x9:
             note = ev[1] & 0x7F
             vel = ev[2] & 0x7F
             if vel > 0:
-                self._launcher_presses[note] = time.time()
-                col, row = self.get_note_xy(note)
-                midi_chan = None
-                if 0 <= col < self.cols:
-                    midi_chan = self.get_filtered_midi_chan_by_index(col + self.scroll_h)
-                if midi_chan is not None:
-                    phrase = row + self.scroll_v
-                    try:
-                        self.zynseq.libseq.togglePlayState(self.zynseq.scene, phrase, midi_chan)
-                    except:
-                        pass
+                self._launcher_note_on(note)
             else:
                 # Note OFF with no velocity: the pad was released.
                 self._launcher_note_off(note)
             return True
-        # Note OFF => a long press on a launcher pad opens its pattern editor
         if evtype == 0x8:
             self._launcher_note_off(ev[1] & 0x7F)
             return True
