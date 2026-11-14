@@ -26,9 +26,10 @@
 
 import logging
 import time
+from math import ceil
 from time import sleep
 from copy import deepcopy
-from threading import Thread, RLock, Event
+from threading import Thread, RLock
 
 # Zynthian specific modules
 from zynlibs.zynseq import zynseq
@@ -89,7 +90,7 @@ CC_CAPTURE = 98
 SS_NUM_ROWS = 8        # Instrument rows visible at once
 SS_NUM_COLS = 8        # Step columns visible at once
 SS_NUM_VELOCITIES = 5  # Velocity levels offered by the brush
-# Steps per beat, used to mark the downbeats in the grid.
+# Steps per beat used to mark the downbeats when the pattern reports none.
 SS_BEAT_DIVISION = 4
 
 # The column of buttons to the right of the grid, as CC numbers, in driver
@@ -117,6 +118,15 @@ SS_VELOCITY_DEFAULT = 2  # index into SS_VELOCITY_VALUES
 # than taken from a JACK MIDI clock tap so this driver has no hard jack/python-jack
 # dependency and no extra child process to manage.
 SS_PLAYHEAD_INTERVAL = 0.015
+
+# Every this many playhead polls, the driver also checks whether the screen has
+# changed the pattern, the keymap or the sequence under it, and repaints. This
+# catches touchscreen edits made while the pattern is stopped.
+SS_SYNC_EVERY = 7
+
+# Audition length for a note entered from the pad, in milliseconds per step,
+# matching the pattern editor's own play_note().
+SS_AUDITION_MS_PER_STEP = 200
 
 
 class COLORS:
@@ -213,62 +223,6 @@ class StepSeqState:
 
     def set_selection_by_sequence(self, seq, row, brush, offset=0):
         self._seqs[seq] = {"row": row, "brush": brush, "offset": offset}
-
-
-# ------------------------------------------------------------------------------------------------------------------
-# Note player used to audition steps and velocity levels.
-#
-# Sends into zynseq's MIDI input so the sound comes out of the chain being
-# edited. Runs in its own thread so a long note does not block the MIDI handler.
-# ------------------------------------------------------------------------------------------------------------------
-class NotePlayer(Thread):
-
-    def __init__(self, libseq):
-        super().__init__()
-        self._libseq = libseq
-        self._ready = Event()
-        self._pending = []
-        self._lock = RLock()
-        self.daemon = True
-        self.start()
-
-    def play(self, note, velocity, duration=0.5, channel=0):
-        with self._lock:
-            self._pending = [(note, velocity, duration, channel)]
-        self._ready.set()
-
-    def end(self):
-        self.running = False
-        self._ready.set()
-
-    def _cycle_ms(self, cycles):
-        # 24 MIDI clock events per beat (quarter note)
-        bpm = self._libseq.getTempo()
-        return max(1, round(60 / bpm / 24 * 1000 * cycles))
-
-    def run(self):
-        self.running = True
-        while self.running:
-            self._ready.wait()
-            with self._lock:
-                if not self._pending:
-                    self._ready.clear()
-                    continue
-                note, velocity, duration, channel = self._pending.pop(0)
-            try:
-                self._send_note("on", note, channel, velocity)
-                time.sleep(self._cycle_ms(duration * 24) / 1000)
-                self._send_note("off", note, channel, 0)
-            except Exception as ex:
-                logging.error(f"Launchpad X note player error: {ex}")
-            with self._lock:
-                if not self._pending:
-                    self._ready.clear()
-
-    def _send_note(self, mode, note, channel, velocity=0):
-        status = 0x90 if mode == "on" else 0x80
-        status |= (channel & 0x0F)
-        self._libseq.sendMidiCommand(status, note & 0x7F, velocity & 0x7F)
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -469,7 +423,11 @@ class StepSeqHandler(ModeHandlerBase):
         self._libseq = self._zynseq.libseq
         self._leds = FeedbackLEDs(driver)
         self._saved_state = StepSeqState()
-        self._note_player = NotePlayer(self._libseq)
+        # Serialises painting between the MIDI thread, the playhead thread and
+        # the GUI thread. Only painting and polling take it; nothing that
+        # calls into Tk does, since Tk calls from other threads wait on the
+        # GUI thread, which may itself be waiting for this lock.
+        self._render_lock = RLock()
         self._playhead = PlayheadMonitor(self._update_playhead)
         self._repeater = ArrowRepeater(self._repeat_arrow)
 
@@ -498,33 +456,47 @@ class StepSeqHandler(ModeHandlerBase):
         self._drag = None
         self._playhead_step = None
         self._is_playing = False
+        # What the grid was built from, so that a change made on the screen -
+        # another pattern, another scale, another length - is noticed.
+        self._keymap_src = None
+        self._pattern_index = None
+        self._pattern_steps = None
+        self._sync_count = 0
 
     def end(self):
         self._playhead.end()
         self._playhead.set_enabled(False)
         self._repeater.end()
-        self._note_player.end()
 
     def set_active(self, active):
-        super().set_active(active)
         if active:
-            self._load_current_selection()
+            super().set_active(True)
+            with self._render_lock:
+                self._load_current_selection()
+                self._refresh_play_state()
+                self.refresh(force=True)
             self._playhead.set_enabled(True)
-            self.refresh()
         else:
+            # Order matters: once inactive, a render already queued on another
+            # thread returns without painting, so nothing lands on top of the
+            # launcher after the LEDs below are cleared.
+            super().set_active(False)
             self._playhead.set_enabled(False)
-            # Leaving the editor: remember the cursor, so that coming back to
-            # this pattern lands in the same place.
-            self._save_selection()
-            self._leds.all_off()
+            self._repeater.stop_repeat()
+            self._pressed_cells.clear()
+            self._drag = None
+            with self._render_lock:
+                # Leaving the editor: remember the cursor, so that coming back
+                # to this pattern lands in the same place.
+                self._save_selection()
+                self._leds.all_off()
 
     # ----- state ---------------------------------------------------------
 
     def get_state(self):
-        return {"stepseq": self._saved_state.save()}
+        return self._saved_state.save()
 
     def set_state(self, state):
-        state = state.get("stepseq")
         if state is not None:
             self._saved_state.load(state)
 
@@ -568,16 +540,58 @@ class StepSeqHandler(ModeHandlerBase):
         """
         pe = self._pattern_editor()
         keymap = []
+        self._keymap_src = None
         if pe is not None:
             try:
+                self._keymap_src = pe.keymap
                 keymap = list(pe.keymap or [])
             except Exception as ex:
                 logging.debug(f"Launchpad X could not read the keymap: {ex}")
         self._keymap = keymap
+        self._pattern_index = self._current_pattern_index()
+        self._pattern_steps = self._pattern_length()
+        self._step_offset = max(0, min(self._step_offset, self._max_step_offset()))
         logging.debug(f"Launchpad X keymap -> {len(self._keymap)} rows")
         if self._keymap:
             self._selected_row = max(0, min(self._selected_row, len(self._keymap) - 1))
         self._scroll_row_window()
+
+    def _sync_with_screen(self):
+        """Follow changes made on the screen while the editor stays open.
+
+        The screen-change signal only fires when the screen itself changes,
+        so switching patterns, scales or the pattern length inside the editor
+        goes unnoticed without this. Returns True if the grid was rebuilt.
+        """
+        try:
+            seq = (self._zynseq.phrase, self._zynseq.chan)
+        except Exception:
+            seq = self._selected_seq
+        if seq != self._selected_seq:
+            self._save_selection()
+            self._select_sequence(*seq)
+            return True
+        pe = self._pattern_editor()
+        keymap_src = getattr(pe, "keymap", None) if pe is not None else None
+        if (keymap_src is not self._keymap_src
+                or self._current_pattern_index() != self._pattern_index
+                or self._pattern_length() != self._pattern_steps):
+            self._load_keymap()
+            return True
+        return False
+
+    def _current_pattern_index(self):
+        try:
+            return self._libseq.getPatternIndex()
+        except Exception:
+            return None
+
+    def _steps_per_beat(self):
+        try:
+            steps = self._libseq.getStepsPerBeat()
+        except Exception:
+            steps = 0
+        return steps if steps > 0 else SS_BEAT_DIVISION
 
     @property
     def _brush_velocity(self):
@@ -692,29 +706,47 @@ class StepSeqHandler(ModeHandlerBase):
         cell = self._pad_to_cell(note)
         if cell is None:
             return False
+        if not self._is_active:
+            return True
         col, row = cell
         step = self._step_offset + col
         index = self._keymap_index(row)
         if step >= self._pattern_length() or not 0 <= index < len(self._keymap):
             self._drag = None
             return False
-        # A drag continues while the finger is moving along the row: each new
-        # pad it reaches extends the note. The gesture has to be quick - a
-        # deliberate press of a second pad is much slower than that, and stays
-        # a separate press.
+        now = time.time()
+        # Hold and tap: while one pad of a row is held, pressing another pad
+        # of the same row stretches the held pad's note to reach it. This does
+        # not depend on which of the two events arrives first.
+        anchor = self._held_press_in_row(index, exclude=note)
+        if anchor is not None:
+            if anchor["drag"] is None:
+                anchor["drag"] = self._begin_drag(anchor["step"], index)
+            self._extend_note(anchor["drag"], step)
+            anchor["drag"]["step"] = step
+            self._pressed_cells[note] = {
+                "time": now, "step": step, "index": index,
+                "drag": None, "consumed": True}
+            return True
+        # A drag continues while the finger slides along the row after a long
+        # press is released: each new pad it reaches extends the note. The
+        # gesture has to be quick - a deliberate press of a second pad is much
+        # slower than that, and stays a separate press.
         if self._drag is not None:
             drag = self._drag
             if drag["index"] == index and drag["step"] != step \
-                    and 0 <= time.time() - drag["time"] <= SS_EXTEND_WINDOW:
+                    and 0 <= now - drag["time"] <= SS_EXTEND_WINDOW:
                 self._extend_note(drag, step)
                 drag["step"] = step
-                drag["time"] = time.time()
+                drag["time"] = now
                 return True
             self._drag = None
         # Keyed by the pad note, and carrying the step and keymap row resolved
         # at press time: the step window can move under a held pad, and the
         # release must still act on the cell that was pressed.
-        self._pressed_cells[note] = (time.time(), step, index)
+        self._pressed_cells[note] = {
+            "time": now, "step": step, "index": index,
+            "drag": None, "consumed": False}
         return True
 
     def note_off(self, note, shifted_override=None):
@@ -722,31 +754,25 @@ class StepSeqHandler(ModeHandlerBase):
         if cell is None:
             return False
         pressed = self._pressed_cells.pop(note, None)
-        if pressed is None:
+        if pressed is None or pressed["consumed"]:
+            # Either not ours, or the tap end of a hold and tap, which the
+            # held pad has already acted on.
             return True
-        pressed_at, step, index = pressed
+        step, index = pressed["step"], pressed["index"]
         if step >= self._pattern_length() or not 0 <= index < len(self._keymap):
             return True
-        if time.time() - pressed_at >= SS_LONG_PRESS_TIME:
+        now = time.time()
+        if pressed["drag"] is not None:
+            # The held end of a hold and tap. Keep the drag alive briefly so
+            # the finger can carry on sliding along the row.
+            self._drag = pressed["drag"]
+            self._drag["time"] = now
+            self._select_cell(pressed["drag"]["start"], index)
+        elif now - pressed["time"] >= SS_LONG_PRESS_TIME:
             # A long press begins a drag: the note is created if the cell is
             # empty, or selected if there is one already, and it is then
             # stretched by moving along the row.
-            note_number = self._keymap[index]["note"]
-            start = self._libseq.getNoteStart(step, note_number)
-            if start == -1:
-                # Nothing here yet - start the note now, so that a drag which
-                # follows stretches it rather than replacing it.
-                self._libseq.addNote(
-                    step, note_number, self._brush_velocity, 1.0, 0)
-                self._mark_pattern_changed()
-                start = step
-            self._drag = {
-                "start": start,
-                "note": note_number,
-                "index": index,
-                "step": step,
-                "time": time.time(),
-            }
+            self._drag = self._begin_drag(step, index)
             self._select_cell(step, index)
         else:
             # A short press. While a drag is in progress it is part of the
@@ -755,12 +781,36 @@ class StepSeqHandler(ModeHandlerBase):
             if self._drag is not None:
                 drag = self._drag
                 if (drag["index"] == index
-                        and 0 <= time.time() - drag["time"] <= SS_EXTEND_WINDOW):
-                    drag["time"] = time.time()
+                        and 0 <= now - drag["time"] <= SS_EXTEND_WINDOW):
+                    drag["time"] = now
                     return True
                 self._drag = None
             self._toggle_note(step, index)
         return True
+
+    def _held_press_in_row(self, index, exclude):
+        """The earliest pad still held on a keymap row, or None."""
+        held = [p for n, p in self._pressed_cells.items()
+                if n != exclude and p["index"] == index and not p["consumed"]]
+        return min(held, key=lambda p: p["time"]) if held else None
+
+    def _begin_drag(self, step, index):
+        """Start stretching the note in a cell, creating it if it is empty."""
+        note_number = self._keymap[index]["note"]
+        start = self._libseq.getNoteStart(step, note_number)
+        if start == -1:
+            # Nothing here yet - start the note now, so that the stretch
+            # which follows lengthens it rather than replacing it.
+            self._add_note(step, note_number, 1.0)
+            self._mark_pattern_changed()
+            start = step
+        return {
+            "start": start,
+            "note": note_number,
+            "index": index,
+            "step": step,
+            "time": time.time(),
+        }
 
     def cc_change(self, ccnum, ccval):
         # Arrow cluster: Up/Down move the cursor between instruments, and the
@@ -778,6 +828,10 @@ class StepSeqHandler(ModeHandlerBase):
             else:
                 self._repeater.stop_repeat()
             return True
+        # Everything below acts on the press only: the device sends a CC
+        # with value 0 on release, which would otherwise act a second time.
+        if ccval <= 0:
+            return True
         if ccnum == 0x5D:
             self._set_step_offset(self._step_offset - SS_NUM_COLS)
             return True
@@ -786,8 +840,6 @@ class StepSeqHandler(ModeHandlerBase):
             return True
         if ccnum == CC_CAPTURE:
             self._state_manager.send_cuia("BACK")
-            return True
-        if ccval <= 0:
             return True
         # The control strip down the right-hand side.
         if ccnum == CC_TRANSPORT:
@@ -801,6 +853,9 @@ class StepSeqHandler(ModeHandlerBase):
 
     def _repeat_arrow(self, direction):
         """Called by the repeater thread while an arrow is held."""
+        if not self._is_active:
+            self._repeater.stop_repeat()
+            return
         self._select_row(self._selected_row + direction)
 
     def _set_brush(self, level):
@@ -866,9 +921,8 @@ class StepSeqHandler(ModeHandlerBase):
         note = self._keymap[index]["note"]
         start = self._libseq.getNoteStart(step, note)
         if start == -1:
-            self._libseq.addNote(step, note, self._brush_velocity, 1.0, 0)
-            self._note_player.play(
-                note, self._brush_velocity, 1.0, self._chain_midi_chan())
+            duration = self._add_note(step, note, self._default_duration())
+            self._audition(note, duration)
         else:
             # A note that is longer than a step covers several cells, so it is
             # removed from where it starts - removing by the cell that was
@@ -877,30 +931,73 @@ class StepSeqHandler(ModeHandlerBase):
         self._mark_pattern_changed()
         self._render_grid()
 
+    def _default_duration(self):
+        """The note length set in the on-screen editor, in steps."""
+        pe = self._pattern_editor()
+        try:
+            duration = float(getattr(pe, "duration", 1.0)) if pe is not None else 1.0
+        except (TypeError, ValueError):
+            duration = 1.0
+        return duration if duration > 0 else 1.0
+
+    def _clamp_duration(self, start, note, duration):
+        """Shorten a note so it ends inside the pattern and before the next
+        note of the same pitch, as the on-screen editor does."""
+        duration = min(duration, max(1, self._pattern_length() - start))
+        for step in range(start + 1, start + ceil(duration)):
+            if self._libseq.getNoteStart(step, note) == step:
+                return float(step - start)
+        return float(duration)
+
+    def _add_note(self, step, note, duration):
+        """Add a note at the brush velocity, with the editor's default note
+        data (play chance, stutter...), so that a note entered on the pad is
+        the same as one entered on the screen. Returns the duration used."""
+        duration = self._clamp_duration(step, note, duration)
+        velocity = self._brush_velocity
+        self._libseq.addNote(step, note, velocity, duration, 0)
+        pe = self._pattern_editor()
+        if pe is not None:
+            try:
+                evdata = pe.get_default_note_evdata()
+                # setNoteData overwrites the velocity; keep the brush's.
+                evdata.val2_start = velocity
+                self._libseq.setNoteData(step, note, evdata)
+            except Exception as ex:
+                logging.debug(f"Launchpad X could not set the note data: {ex}")
+        return duration
+
+    def _audition(self, note, duration):
+        """Play a newly entered note, but only while the pattern is stopped,
+        like the on-screen editor - otherwise it doubles the sequence."""
+        try:
+            if self._is_sequence_playing():
+                return
+            self._libseq.playNote(
+                note, self._brush_velocity, self._chain_midi_chan() & 0x0F,
+                int(SS_AUDITION_MS_PER_STEP * duration))
+        except Exception as ex:
+            logging.debug(f"Launchpad X could not audition a note: {ex}")
+
     def _extend_note(self, pending, new_step):
         """Lengthen or shorten a note so that it reaches `new_step`.
 
         The note is removed and re-added with the new duration, because libseq
-        has no call to change a note's length in place. That loses any
-        per-note extras such as stutter or play chance, which a note created
-        here never had.
+        has no call to change a note's length in place. Its velocity, offset
+        and note data (stutter, play chance...) are carried over.
         """
         start = pending["start"]
         note = pending["note"]
-        duration = max(1, new_step - start + 1)
-        # Never reach past the end of the pattern.
-        duration = min(duration, max(1, self._pattern_length() - start))
-        # Never run over another note of the same pitch: the on-screen editor
-        # does not allow that, and the two must agree.
-        for step in range(start + 1, start + duration):
-            if self._libseq.getNoteStart(step, note) == step:
-                duration = step - start
-                break
+        duration = self._clamp_duration(start, note, max(1, new_step - start + 1))
         if duration <= 0:
             return False
         velocity = self._libseq.getNoteVelocity(start, note)
+        offset = self._libseq.getNoteOffset(start, note)
+        evdata = self._zynseq.get_note_data(start, note)
         self._libseq.removeNote(start, note)
-        self._libseq.addNote(start, note, velocity, float(duration), 0)
+        self._libseq.addNote(start, note, velocity, duration, offset)
+        if evdata is not None:
+            self._libseq.setNoteData(start, note, evdata)
         self._mark_pattern_changed()
         self._render_grid()
         return True
@@ -922,19 +1019,43 @@ class StepSeqHandler(ModeHandlerBase):
 
     # ----- external state ------------------------------------------------
 
-    def update_seq_state(self, phrase, chan, state=None, mode=None, group=None):
-        if state is not None:
-            self._is_playing = state != zynseq.SEQ_STOPPED
+    def update_seq_state(self, phrase, chan):
+        """A sequence changed play state (zynpad signal)."""
+        if (phrase, chan) == self._selected_seq:
+            self._refresh_play_state()
 
-    def on_screen_change(self, screen):
-        self._current_screen = screen
+    def _refresh_play_state(self):
+        """Read the play state of the edited sequence, and redraw the
+        transport button if it changed. Returns True if the sequence plays."""
+        try:
+            playing = self._is_sequence_playing()
+        except Exception:
+            playing = False
+        if playing != self._is_playing:
+            self._is_playing = playing
+            self._render_controls()
+        return playing
 
     # ----- rendering -----------------------------------------------------
 
-    def refresh(self):
-        self.control_off()
-        self._render_grid()
-        self._render_controls()
+    def refresh(self, force=False):
+        """Repaint the surface.
+
+        `force` clears every LED first, which is needed once on entering the
+        mode because the launcher paints outside the LED cache. Otherwise the
+        cache already knows what is lit, and a forced clear would only make
+        the grid flicker.
+        """
+        with self._render_lock:
+            if not self._is_active:
+                return
+            if force:
+                self.control_off()
+            else:
+                for ccnum in (0x5B, 0x5C, 0x5D, 0x5E, CC_CAPTURE):
+                    self._leds.cc_off(ccnum)
+            self._render_grid()
+            self._render_controls()
 
     def control_off(self):
         # Launcher mode paints the grid straight through lib_zyncore, bypassing
@@ -961,83 +1082,97 @@ class StepSeqHandler(ModeHandlerBase):
 
     def _render_grid(self):
         """Draw the piano roll: a note per cell, coloured by its velocity."""
-        length = self._pattern_length()
-        for row in range(SS_NUM_ROWS):
-            index = self._keymap_index(row)
-            selected = index == self._selected_row
-            for col in range(SS_NUM_COLS):
-                pad = self._cell_pad(col, row)
-                step = self._step_offset + col
-                if not 0 <= index < len(self._keymap) or step >= length:
-                    self._leds.pad_off(pad)
-                    continue
-                note = self._keymap[index]["note"]
-                # The playhead is a column, drawn over everything in it, the
-                # way the touchscreen draws its cursor.
-                if step == self._playhead_step:
-                    self._leds.pad_on(pad, COLORS.PLAYHEAD, 2)
-                    continue
-                # getNoteStart returns the step a note covering this cell
-                # starts at, so a note longer than a step shows its first
-                # step lit and the rest as a tail.
-                start = self._libseq.getNoteStart(step, note)
-                if start == -1:
-                    # An empty cell on a downbeat is marked, so the beat grid
-                    # is readable at a glance.
-                    if step % SS_BEAT_DIVISION == 0:
-                        self._leds.pad_on(pad, COLORS.BEAT_MARKER)
-                    else:
+        with self._render_lock:
+            if not self._is_active:
+                return
+            length = self._pattern_length()
+            steps_per_beat = self._steps_per_beat()
+            for row in range(SS_NUM_ROWS):
+                index = self._keymap_index(row)
+                selected = index == self._selected_row
+                for col in range(SS_NUM_COLS):
+                    pad = self._cell_pad(col, row)
+                    step = self._step_offset + col
+                    if not 0 <= index < len(self._keymap) or step >= length:
                         self._leds.pad_off(pad)
-                    continue
-                # The selected instrument's row pulses, so the cursor is
-                # obvious without hiding the note colours.
-                channel = 2 if selected else 0
-                if start == step:
-                    level = self._step_velocity_level(step, note)
-                    self._leds.pad_on(pad, COLORS.VELOCITY_STEP[level], channel)
-                else:
-                    self._leds.pad_on(pad, COLORS.NOTE_TAIL, channel)
+                        continue
+                    note = self._keymap[index]["note"]
+                    # The playhead is a column, drawn over everything in it,
+                    # the way the touchscreen draws its cursor.
+                    if step == self._playhead_step:
+                        self._leds.pad_on(pad, COLORS.PLAYHEAD, 2)
+                        continue
+                    # getNoteStart returns the step a note covering this cell
+                    # starts at, so a note longer than a step shows its first
+                    # step lit and the rest as a tail.
+                    start = self._libseq.getNoteStart(step, note)
+                    if start == -1:
+                        # An empty cell on a downbeat is marked, so the beat
+                        # grid is readable at a glance.
+                        if step % steps_per_beat == 0:
+                            self._leds.pad_on(pad, COLORS.BEAT_MARKER)
+                        else:
+                            self._leds.pad_off(pad)
+                        continue
+                    # The selected instrument's row pulses, so the cursor is
+                    # obvious without hiding the note colours.
+                    channel = 2 if selected else 0
+                    if start == step:
+                        level = self._step_velocity_level(step, note)
+                        self._leds.pad_on(pad, COLORS.VELOCITY_STEP[level], channel)
+                    else:
+                        self._leds.pad_on(pad, COLORS.NOTE_TAIL, channel)
 
     def _render_controls(self):
         """Draw the control strip: transport and the velocity brush."""
-        colour = COLORS.TRANSPORT_ACTIVE if self._is_playing else COLORS.TRANSPORT
-        self._leds.cc_on(CC_TRANSPORT, colour, 2 if self._is_playing else 0)
-        for index, ccnum in enumerate(SS_VELOCITY_CCS):
-            if index == self._brush:
-                self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE_SELECTED, 2)
-            else:
-                self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE)
+        with self._render_lock:
+            if not self._is_active:
+                return
+            colour = COLORS.TRANSPORT_ACTIVE if self._is_playing else COLORS.TRANSPORT
+            self._leds.cc_on(CC_TRANSPORT, colour, 2 if self._is_playing else 0)
+            for index, ccnum in enumerate(SS_VELOCITY_CCS):
+                if index == self._brush:
+                    self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE_SELECTED, 2)
+                else:
+                    self._leds.cc_on(ccnum, COLORS.VELOCITY_LANE)
 
     def _update_playhead(self):
         """Called from the playhead monitor thread."""
         try:
-            if self._libseq.getPlayState(
-                    self._zynseq.scene,
-                    self._selected_seq[0],
-                    self._selected_seq[1]) == zynseq.SEQ_STOPPED:
-                new_step = None
-            else:
-                clocks_per_step = self._libseq.getClocksPerStep()
-                if clocks_per_step <= 0:
-                    new_step = None
-                else:
-                    position = self._libseq.getSequencePlayPosition(
-                        self._zynseq.scene,
-                        self._selected_seq[0],
-                        self._selected_seq[1])
-                    index = int(position) // clocks_per_step
+            with self._render_lock:
+                if not self._is_active:
+                    return
+                repaint = False
+                self._sync_count += 1
+                if self._sync_count >= SS_SYNC_EVERY:
+                    # Follow the screen, and repaint so that edits made on the
+                    # touchscreen appear while the pattern is stopped. The LED
+                    # cache drops the sends that would change nothing.
+                    self._sync_count = 0
+                    if self._sync_with_screen():
+                        self._render_controls()
+                    repaint = True
+                if self._refresh_play_state():
+                    # libseq's own playhead for the edited pattern, as the
+                    # on-screen editor uses.
+                    index = int(self._libseq.getPatternPlayhead())
                     new_step = index if index < self._pattern_length() else None
-            if new_step != self._playhead_step:
-                self._playhead_step = new_step
-                # The window follows the playhead a page at a time, so within
-                # a page only the playhead column moves and the grid is still.
-                # When it stops, the window stays where the playhead left it.
-                if new_step is not None:
-                    page = (new_step // SS_NUM_COLS) * SS_NUM_COLS
-                    if page != self._step_offset:
-                        self._step_offset = max(
-                            0, min(page, self._max_step_offset()))
-                self._render_grid()
+                else:
+                    new_step = None
+                if new_step != self._playhead_step:
+                    self._playhead_step = new_step
+                    # The window follows the playhead a page at a time, so
+                    # within a page only the playhead column moves and the
+                    # grid is still. When it stops, the window stays where
+                    # the playhead left it.
+                    if new_step is not None:
+                        page = (new_step // SS_NUM_COLS) * SS_NUM_COLS
+                        if page != self._step_offset:
+                            self._step_offset = max(
+                                0, min(page, self._max_step_offset()))
+                    repaint = True
+                if repaint:
+                    self._render_grid()
         except Exception as ex:
             logging.error(f"Launchpad X playhead update error: {ex}")
 
@@ -1059,6 +1194,8 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         # Launcher pad presses in flight, so a long press can be told from a
         # tap. The launcher path used to look at note-on only.
         self._launcher_presses = {}
+        # Notes held in note mode, and the MIDI channel each was sent on.
+        self._note_mode_held = {}
 
     def send_sysex(self, data):
         if self.idev_out is not None:
@@ -1111,17 +1248,14 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
     # ----- mode switching -------------------------------------------------
 
     def _on_gui_show_screen(self, screen):
-        """The on-screen Pattern Editor is the single source of truth for the mode."""
+        """The on-screen Pattern Editor is the single source of truth for the mode.
+
+        This signal only fires when the screen changes. A pattern, scale or
+        length change made while the editor stays open is picked up by the
+        handler's own poll instead.
+        """
         if screen == "pattern_editor":
-            if self._mode == MODE_STEPSEQ and self._stepseq is not None:
-                # Already in stepseq mode, so set_mode() returns early. The player
-                # can switch patterns without ever leaving the Pattern Editor, so
-                # reload the keymap and repaint rather than showing the previous
-                # pattern's instruments.
-                self._stepseq._load_keymap()
-                self._stepseq.refresh()
-            else:
-                self.set_mode(MODE_STEPSEQ)
+            self.set_mode(MODE_STEPSEQ)
         elif self._mode == MODE_STEPSEQ:
             self.set_mode(MODE_LAUNCHER)
 
@@ -1130,6 +1264,10 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             return
         self._mode = mode
         if mode == MODE_STEPSEQ:
+            if self._note_mode:
+                # The step sequencer paints Session-layout note numbers, so
+                # the device must leave its Note layout first.
+                self._exit_note_mode(refresh=False)
             self._stepseq.set_active(True)
         else:
             self._stepseq.set_active(False)
@@ -1151,7 +1289,11 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
     def set_state(self, state):
         super().set_state(state)
         if self._stepseq is not None and "stepseq" in state:
-            self._stepseq.set_state(state)
+            stepseq = state["stepseq"]
+            # Snapshots saved by earlier builds of this branch nest it twice.
+            if isinstance(stepseq, dict) and isinstance(stepseq.get("stepseq"), dict):
+                stepseq = stepseq["stepseq"]
+            self._stepseq.set_state(stepseq)
 
     # ----- signal routing -------------------------------------------------
 
@@ -1291,10 +1433,23 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         logging.info("Launchpad X note mode on")
         return True
 
-    def _exit_note_mode(self):
+    def _exit_note_mode(self, refresh=True):
         self._note_mode = False
-        self._restore_session_layout()
+        self._release_held_notes()
+        if refresh:
+            self._restore_session_layout()
+        elif self.idev_out is not None:
+            self.send_sysex("00 00")
         logging.info("Launchpad X note mode off")
+
+    def _release_held_notes(self):
+        """Send a note-off for every pad still held in note mode."""
+        held, self._note_mode_held = self._note_mode_held, {}
+        for note, chan in held.items():
+            try:
+                self.zynseq.libseq.sendMidiCommand(0x80 | (chan & 0x0F), note, 0)
+            except Exception as ex:
+                logging.error(f"Launchpad X could not release a note: {ex}")
 
     def _note_mode_channel(self):
         """The MIDI channel of the chain to play, or None if there is none."""
@@ -1320,9 +1475,9 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
         if time.time() - pressed_at < SS_LONG_PRESS_TIME:
             return False
         col, row = self.get_note_xy(note)
-        if col >= self.cols:
+        if not 0 <= col < self.cols:
             return False
-        midi_chan = self.get_filtered_midi_chan_by_index(col)
+        midi_chan = self.get_filtered_midi_chan_by_index(col + self.scroll_h)
         if midi_chan is None:
             return False
         self._open_pattern_editor(row + self.scroll_v, midi_chan)
@@ -1348,20 +1503,40 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             return False
 
     def _note_mode_midi_event(self, ev, evtype):
-        """Forward the pad's notes to the chain, so the pad can be played."""
-        if evtype not in (0x9, 0x8):
+        """Forward the pad's notes and pressure to the chain, so the pad can
+        be played.
+
+        The channel is remembered per note at note-on, so that the note-off
+        and the pressure go to the same chain even if the active chain
+        changes while the pad is held - otherwise the note would hang.
+        """
+        if evtype not in (0x9, 0x8, 0xA, 0xD):
             return True
-        note = ev[1] & 0x7F
-        vel = ev[2] & 0x7F
-        if evtype == 0x9 and vel == 0:
+        value1 = ev[1] & 0x7F
+        value2 = ev[2] & 0x7F if len(ev) > 2 else 0
+        if evtype == 0x9 and value2 == 0:
             evtype = 0x8
-            vel = 0
-        chan = self._note_mode_channel()
+        if evtype == 0x9:
+            chan = self._note_mode_channel()
+            if chan is None:
+                return True
+            self._note_mode_held[value1] = chan
+        elif evtype == 0x8:
+            chan = self._note_mode_held.pop(value1, None)
+            if chan is None:
+                chan = self._note_mode_channel()
+        elif evtype == 0xA:
+            # Polyphonic pressure follows its note.
+            chan = self._note_mode_held.get(value1)
+        else:
+            # Channel pressure has a single data byte.
+            chan = self._note_mode_channel()
+            value2 = 0
         if chan is None:
             return True
-        status = (0x90 if evtype == 0x9 else 0x80) | (chan & 0x0F)
+        status = (evtype << 4) | (chan & 0x0F)
         try:
-            self.zynseq.libseq.sendMidiCommand(status, note, vel)
+            self.zynseq.libseq.sendMidiCommand(status, value1, value2)
         except Exception as ex:
             logging.error(f"Launchpad X could not forward a note: {ex}")
         return True
@@ -1389,7 +1564,9 @@ class zynthian_ctrldev_launchpad_x(zynthian_ctrldev_zynpad):
             if vel > 0:
                 self._launcher_presses[note] = time.time()
                 col, row = self.get_note_xy(note)
-                midi_chan = self.get_filtered_midi_chan_by_index(col)
+                midi_chan = None
+                if 0 <= col < self.cols:
+                    midi_chan = self.get_filtered_midi_chan_by_index(col + self.scroll_h)
                 if midi_chan is not None:
                     phrase = row + self.scroll_v
                     try:
