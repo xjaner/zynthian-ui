@@ -44,13 +44,26 @@ Launcher
                    starting it.
     Right column   Launch or stop a whole phrase.
     Arrows         Sent as ARROW_UP/DOWN/LEFT/RIGHT to the Zynthian UI.
-    Note           Note mode (below).
+    Note           Keyboard (below).
 
-Note mode
-    The device shows its own Note layout. Pads play the active chain, with
-    pressure. Each note's MIDI channel is fixed at note-on, so a note-off
-    still reaches the right chain if the active chain changes. Session goes
-    back to the launcher.
+Keyboard
+    The grid plays the active chain, with velocity and pressure. The pads
+    follow the scale and root note of the pattern last opened in the
+    Pattern Editor: each pad to the right is the next note of the scale, and
+    each row is a fourth higher. A chromatic pattern, a custom keymap or no
+    pattern gives a chromatic layout. Root notes are lit in the chain's
+    colour, other notes grey (black keys dim when chromatic), and sounding
+    notes green.
+    Up / Down      One octave higher / lower.
+    Left / Right   One scale step lower / higher.
+    Right column   4: sustain pedal, while held.
+    Session        Back to the launcher.
+    A note's chain and pitch are fixed when its pad goes down, so it stops
+    properly even if the chain or the octave changes while it is held.
+
+    The device's own Note layout isn't used, because its pads send on the
+    MIDI port (IN 2), which goes straight to the chains. In Session layout
+    the pads send on the DAW port, with velocity and polyphonic pressure.
 
 Step sequencer (Pattern Editor open)
     The grid mirrors the screen's piano roll. Each row is one note of the
@@ -99,6 +112,7 @@ Internals
                      cursor row per sequence.
 """
 
+import json
 import logging
 import time
 from math import ceil
@@ -210,6 +224,21 @@ SS_SYNC_EVERY = 7
 # matching the pattern editor's own play_note().
 SS_AUDITION_MS_PER_STEP = 200
 
+# Keyboard. Each row is a fourth above the one below, like the device's own
+# Note layout: 3 scale steps in a scale, 5 semitones when chromatic.
+KEYS_ROW_DEGREES = 3
+KEYS_ROW_SEMITONES = 5
+# The bottom-left pad starts on this note (C3), or on the scale's first note
+# from there up.
+KEYS_DEFAULT_NOTE = 48
+# Right column button 4 is the sustain pedal.
+CC_SUSTAIN = SS_RIGHT_COL_CCS[3]
+# The pattern editor's scales. libseq's scale 0 is a custom keymap and 1 is
+# chromatic; scale N > 1 is entry N - 1 of this file.
+KEYS_SCALES_FPATH = "/zynthian/zynthian-data/zynseq/scales.json"
+# Pitch classes of the black keys, dimmed in the chromatic layout.
+KEYS_BLACK_KEYS = (1, 3, 6, 8, 10)
+
 
 class COLORS:
     """Launchpad palette indices, measured on a Launchpad X.
@@ -256,6 +285,15 @@ class COLORS:
     # Transport buttons (right column)
     TRANSPORT = 37
     TRANSPORT_ACTIVE = 21
+    # Keyboard. The root notes are lit in the chain's colour (this one if
+    # the chain has none); other notes grey, the chromatic layout's black
+    # keys dim, and a sounding note green.
+    KEY_ROOT = 41
+    KEY = 2
+    KEY_BLACK = 1
+    KEY_PRESSED = 21
+    SUSTAIN = 11
+    SUSTAIN_ON = 9
 
 
 def _migrate_extras(chain):
@@ -479,6 +517,13 @@ class FeedbackLEDs:
             self._driver.send_led_note(note, COLORS.OFF, 0)
         for ccnum in ccs:
             self._driver.send_led_cc(ccnum, COLORS.OFF, 0)
+
+    def forget(self):
+        """Drop the tracked state without sending anything, after the
+        device has been cleared some other way."""
+        with self._lock:
+            self._pads.clear()
+            self._ccs.clear()
 
     def all_off(self):
         with self._lock:
@@ -1385,6 +1430,308 @@ class StepSeqHandler(ModeHandlerBase):
 
 
 # ------------------------------------------------------------------------------------------------------------------
+# Keyboard mode handler
+# ------------------------------------------------------------------------------------------------------------------
+
+
+class KeysHandler(ModeHandlerBase):
+    """The keyboard: the grid plays the active chain, in key.
+
+    The pads follow the scale and root note of the pattern last opened in
+    the Pattern Editor, which is the one libseq has selected. Each pad to
+    the right is the next note of the scale and each row is a fourth higher.
+    A chromatic or custom-keymap pattern, or none, gives the chromatic
+    layout, with the black keys dim.
+
+    A pad's "position" counts from note 0 in scale steps, or in semitones
+    when chromatic. The bottom-left pad's position is the origin, which the
+    arrows move.
+    """
+
+    def __init__(self, state_manager, driver):
+        super().__init__(state_manager)
+        self._driver = driver
+        self._libseq = self._zynseq.libseq
+        self._leds = FeedbackLEDs(driver)
+        # Taken by the MIDI thread and by refreshes from signal handlers.
+        self._lock = RLock()
+        self._scales = None
+        # The scale's semitone offsets from the root, or None when chromatic.
+        self._intervals = None
+        self._tonic = 0
+        # The (scale, tonic) the layout was built from, None before the first.
+        self._layout_src = None
+        self._origin = KEYS_DEFAULT_NOTE
+        # Sounding notes by pad: (channel, note), fixed at note-on so that
+        # the note-off reaches the same chain and note even if the chain or
+        # the octave changes while the pad is held.
+        self._held = {}
+        # The channel the sustain pedal went down on, None while it is up.
+        self._sustain_chan = None
+
+    def end(self):
+        self.release_all()
+
+    def set_active(self, active):
+        with self._lock:
+            if active:
+                super().set_active(True)
+                # The device was cleared by the driver, so forget what was lit.
+                self._leds.forget()
+                self.refresh()
+            else:
+                self.release_all()
+                super().set_active(False)
+                self._leds.all_off()
+
+    # ----- layout ----------------------------------------------------------
+
+    def _scale_intervals(self, scale):
+        """The semitone offsets of a libseq scale, or None for chromatic."""
+        if scale < 2:
+            return None
+        if self._scales is None:
+            try:
+                with open(KEYS_SCALES_FPATH) as fh:
+                    self._scales = json.load(fh)
+            except Exception as ex:
+                logging.error(f"Launchpad can't load the scales: {ex}")
+                self._scales = []
+        try:
+            intervals = sorted({int(i) % 12 for i in self._scales[scale - 1]["scale"]})
+        except Exception:
+            return None
+        if not intervals or len(intervals) == 12:
+            return None
+        return intervals
+
+    def _load_layout(self):
+        """Follow the selected pattern's scale and root, keeping the
+        bottom-left pad as close as possible to the note it was on."""
+        try:
+            scale = self._libseq.getScale()
+            tonic = self._libseq.getTonic() % 12
+        except Exception:
+            scale, tonic = 0, 0
+        if (scale, tonic) == self._layout_src:
+            return
+        bottom = KEYS_DEFAULT_NOTE if self._layout_src is None else self._note_at(self._origin)
+        self._layout_src = (scale, tonic)
+        self._intervals = self._scale_intervals(scale)
+        self._tonic = tonic
+        self._origin = self._position_of(bottom)
+
+    def _note_at(self, position):
+        if self._intervals is None:
+            return position
+        n = len(self._intervals)
+        return self._tonic + 12 * (position // n) + self._intervals[position % n]
+
+    def _position_of(self, note):
+        """The position of the lowest note of the layout at or above note."""
+        if self._intervals is None:
+            return note
+        position = ((note - self._tonic) // 12) * len(self._intervals)
+        while self._note_at(position) < note:
+            position += 1
+        return position
+
+    def _row_step(self):
+        return KEYS_ROW_SEMITONES if self._intervals is None else KEYS_ROW_DEGREES
+
+    def _octave_step(self):
+        return 12 if self._intervals is None else len(self._intervals)
+
+    def _pad_note(self, col, prow):
+        """The note of a pad, by column and row from the bottom, or None if
+        it is outside the MIDI range."""
+        note = self._note_at(self._origin + col + prow * self._row_step())
+        return note if 0 <= note <= 127 else None
+
+    @staticmethod
+    def _pad_xy(pad):
+        """A grid pad's column and row from the bottom, or None."""
+        col, prow = pad % 10 - 1, pad // 10 - 1
+        if 0 <= col < 8 and 0 <= prow < 8:
+            return col, prow
+        return None
+
+    def _can_shift(self, delta):
+        """True if the bottom-left pad stays inside the MIDI range."""
+        return 0 <= self._note_at(self._origin + delta) <= 127
+
+    def _shift(self, delta):
+        with self._lock:
+            if self._can_shift(delta):
+                self._origin += delta
+                self.refresh()
+
+    # ----- playing -----------------------------------------------------------
+
+    def _chain_chan(self):
+        """The MIDI channel of the active chain, or None if it has none it
+        can be played on."""
+        try:
+            chan = self._chain_manager.get_active_chain().midi_chan
+        except Exception:
+            return None
+        if isinstance(chan, int) and 0 <= chan < MAX_NUM_MIDI_CHANS:
+            return chan
+        return None
+
+    def _send(self, status, value1, value2=0):
+        try:
+            self._libseq.sendMidiCommand(status, value1, value2)
+        except Exception as ex:
+            logging.error(f"Launchpad could not send a note: {ex}")
+
+    def note_on(self, pad, velocity, shifted_override=None):
+        with self._lock:
+            xy = self._pad_xy(pad)
+            if xy is None or pad in self._held:
+                return
+            note = self._pad_note(*xy)
+            chan = self._chain_chan()
+            if note is None or chan is None:
+                return
+            self._held[pad] = (chan, note)
+            self._send(0x90 | chan, note, velocity)
+            self._render_grid()
+
+    def note_off(self, pad, shifted_override=None):
+        with self._lock:
+            held = self._held.pop(pad, None)
+            if held is None:
+                return
+            chan, note = held
+            self._send(0x80 | chan, note, 0)
+            self._render_grid()
+
+    def pressure(self, pad, value):
+        """Polyphonic pressure follows its pad's note."""
+        held = self._held.get(pad)
+        if held is not None:
+            self._send(0xA0 | held[0], held[1], value)
+
+    def channel_pressure(self, value):
+        chans = {chan for chan, _ in self._held.values()}
+        if not chans:
+            chan = self._chain_chan()
+            chans = {chan} if chan is not None else set()
+        for chan in chans:
+            self._send(0xD0 | chan, value)
+
+    def _sustain(self, down):
+        with self._lock:
+            if down:
+                if self._sustain_chan is not None:
+                    return
+                chan = self._chain_chan()
+                if chan is None:
+                    return
+                self._sustain_chan = chan
+                self._send(0xB0 | chan, 64, 127)
+            else:
+                if self._sustain_chan is None:
+                    return
+                self._send(0xB0 | self._sustain_chan, 64, 0)
+                self._sustain_chan = None
+            self._render_controls()
+
+    def release_all(self):
+        """Stop every sounding note, and lift the sustain pedal."""
+        with self._lock:
+            held, self._held = self._held, {}
+            for chan, note in held.values():
+                self._send(0x80 | chan, note, 0)
+            if self._sustain_chan is not None:
+                self._send(0xB0 | self._sustain_chan, 64, 0)
+                self._sustain_chan = None
+
+    def cc_change(self, ccnum, ccval):
+        if ccnum == CC_SUSTAIN:
+            self._sustain(ccval > 0)
+            return
+        if ccval == 0:
+            return
+        if ccnum == CC_UP:
+            self._shift(self._octave_step())
+        elif ccnum == CC_DOWN:
+            self._shift(-self._octave_step())
+        elif ccnum == CC_RIGHT:
+            self._shift(1)
+        elif ccnum == CC_LEFT:
+            self._shift(-1)
+
+    # ----- painting ----------------------------------------------------------
+
+    def refresh(self, force=False):
+        with self._lock:
+            if not self._is_active:
+                return
+            if force:
+                self._leds.forget()
+            self._load_layout()
+            self._render_grid()
+            self._render_controls()
+
+    def _root_colour(self):
+        try:
+            return zynthian_gui_config.LAUNCHER_COLOUR[self._chain_chan()]["launchpad"]
+        except Exception:
+            return COLORS.KEY_ROOT
+
+    def _pad_colour(self, note, sounding, root_colour):
+        if note is None:
+            return COLORS.OFF
+        if note in sounding:
+            return COLORS.KEY_PRESSED
+        if (note - self._tonic) % 12 == 0:
+            return root_colour
+        if self._intervals is None and note % 12 in KEYS_BLACK_KEYS:
+            return COLORS.KEY_BLACK
+        return COLORS.KEY
+
+    def _render_grid(self):
+        if not self._is_active:
+            return
+        # A note can be on more than one pad; all of them light while it sounds.
+        sounding = {note for _, note in self._held.values()}
+        root_colour = self._root_colour()
+        for prow in range(8):
+            for col in range(8):
+                pad = 10 * (prow + 1) + col + 1
+                colour = self._pad_colour(self._pad_note(col, prow), sounding, root_colour)
+                if colour == COLORS.OFF:
+                    self._leds.pad_off(pad)
+                else:
+                    self._leds.pad_on(pad, colour)
+
+    def _render_controls(self):
+        if not self._is_active:
+            return
+        octave, step = self._octave_step(), 1
+        lit = {
+            CC_UP: self._can_shift(octave),
+            CC_DOWN: self._can_shift(-octave),
+            CC_RIGHT: self._can_shift(step),
+            CC_LEFT: self._can_shift(-step),
+        }
+        for ccnum, on in lit.items():
+            if on:
+                self._leds.cc_on(ccnum, COLORS.ARROW)
+            else:
+                self._leds.cc_off(ccnum)
+        for ccnum in SS_RIGHT_COL_CCS:
+            if ccnum == CC_SUSTAIN:
+                self._leds.cc_on(ccnum, COLORS.SUSTAIN_ON if self._sustain_chan is not None
+                                 else COLORS.SUSTAIN)
+            else:
+                self._leds.cc_off(ccnum)
+        self._leds.cc_off(self._driver.cc_back)
+
+
+# ------------------------------------------------------------------------------------------------------------------
 class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
     """Base driver for the Novation Launchpad family.
 
@@ -1401,7 +1748,6 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
     sysex_device_id = None
     # Layout selection SysEx payloads.
     sysex_layout_session = "00 00"
-    sysex_layout_note = "00 01"
     # The layout left on the device when the driver ends.
     sysex_layout_standalone = "00 05"
     # The device's own layout buttons, which send CCs even in DAW mode.
@@ -1415,14 +1761,12 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         super().__init__(state_manager, idev_in, idev_out)
         self._mode = MODE_LAUNCHER
         self._stepseq = None
-        # True while the device is in its Note layout and the pad is being
-        # played rather than used to launch patterns.
+        self._keys = None
+        # True while the grid is the keyboard rather than the launcher.
         self._note_mode = False
         # Launcher pad presses in flight, so a long press can be told from a
         # tap. The launcher path used to look at note-on only.
         self._launcher_presses = {}
-        # Notes held in note mode, and the MIDI channel each was sent on.
-        self._note_mode_held = {}
 
     def send_sysex(self, data):
         if self.idev_out is not None and self.sysex_device_id is not None:
@@ -1459,12 +1803,15 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         # Select session layout (session = 0x00, faders = 0x0D)
         self.send_sysex(self.sysex_layout_session)
         self._stepseq = StepSeqHandler(self.state_manager, self, self.idev)
+        self._keys = KeysHandler(self.state_manager, self)
         super().init()
         zynsigman.register(zynsigman.S_GUI, zynsigman.SS_GUI_SHOW_SCREEN, self._on_gui_show_screen)
 
     def end(self):
         if self._stepseq is not None:
             self._stepseq.end()
+        if self._keys is not None:
+            self._keys.end()
         zynsigman.unregister(zynsigman.S_GUI, zynsigman.SS_GUI_SHOW_SCREEN, self._on_gui_show_screen)
         super().end()
         # Exit DAW session mode
@@ -1492,8 +1839,7 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         self._mode = mode
         if mode == MODE_STEPSEQ:
             if self._note_mode:
-                # The step sequencer paints Session-layout note numbers, so
-                # the device must leave its Note layout first.
+                # The step sequencer takes over the grid.
                 self._exit_note_mode(refresh=False)
             self._stepseq.set_active(True)
         else:
@@ -1530,11 +1876,17 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
             zynthian_ctrldev_base.refresh(self)
             self._stepseq.refresh()
             return
-        if self._note_mode:
-            # The device shows its own Note layout, which the driver must not
-            # paint over.
+        if self._note_mode and self._keys is not None:
+            zynthian_ctrldev_base.refresh(self)
+            self._keys.refresh()
             return
         super().refresh()
+
+    def on_active_chain(self, active_chain_id):
+        super().on_active_chain(active_chain_id)
+        # The keyboard plays the active chain and shows its colour.
+        if self._note_mode and self._keys is not None:
+            self._keys.refresh()
 
     def update_seq_state(self, phrase, chan):
         if self._mode == MODE_STEPSEQ and self._stepseq is not None:
@@ -1606,6 +1958,10 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         if self.idev_out is None:
             return
         self.send_sysex(self.sysex_layout_session)
+        if self._note_mode and self._keys is not None:
+            # The other layout drew its own LEDs; paint the keyboard in full.
+            self._keys.refresh(force=True)
+            return
         self.refresh()
 
     # ----- the device's own layout buttons --------------------------------
@@ -1619,9 +1975,9 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         entirely different.
 
         In the pattern editor, Session means "go back to the launcher". In the
-        launcher, Note means "play the instrument", and the device's own Note
-        layout is left to show itself. Custom is not a layout this driver
-        paints, so it always falls back to Session.
+        launcher, Note means "play the instrument": the device goes back to
+        its Session layout and the driver draws the keyboard. Custom is not a
+        layout this driver paints, so it always falls back to Session.
         """
         if self._mode == MODE_STEPSEQ:
             if ccnum == self.cc_session:
@@ -1646,46 +2002,32 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         return True
 
     def _enter_note_mode(self):
-        """Switch the device to its Note layout and play the active chain.
+        """Turn the grid into a keyboard for the active chain.
 
-        The device's Note layout is left to show itself - the driver stops
-        painting the grid - and the pad's notes are forwarded to the chain, so
-        the pad becomes a keyboard for whatever is loaded.
+        Pressing Note has already switched the device to its own Note
+        layout, whose pads send on the MIDI port, where this driver doesn't
+        listen. So the device goes back to Session layout, whose pads send
+        on the DAW port with velocity and pressure, and the driver draws the
+        keyboard there.
         """
-        if self.idev_out is None:
+        if self.idev_out is None or self._keys is None:
             return False
         self._note_mode = True
-        self.send_sysex(self.sysex_layout_note)
-        logging.info("Launchpad note mode on")
+        self.send_sysex(self.sysex_layout_session)
+        self.light_off()
+        self._keys.set_active(True)
+        logging.info("Launchpad keyboard on")
         return True
 
     def _exit_note_mode(self, refresh=True):
+        """Back from the keyboard. Sounding notes are stopped, and with
+        refresh the launcher is repainted."""
         self._note_mode = False
-        self._release_held_notes()
+        if self._keys is not None:
+            self._keys.set_active(False)
         if refresh:
             self._restore_session_layout()
-        elif self.idev_out is not None:
-            self.send_sysex(self.sysex_layout_session)
-        logging.info("Launchpad note mode off")
-
-    def _release_held_notes(self):
-        """Send a note-off for every pad still held in note mode."""
-        held, self._note_mode_held = self._note_mode_held, {}
-        for note, chan in held.items():
-            try:
-                self.zynseq.libseq.sendMidiCommand(0x80 | (chan & 0x0F), note, 0)
-            except Exception as ex:
-                logging.error(f"Launchpad could not release a note: {ex}")
-
-    def _note_mode_channel(self):
-        """The MIDI channel of the chain to play, or None if there is none."""
-        try:
-            chain = self.chain_manager.get_active_chain()
-            if chain is not None and chain.midi_chan is not None:
-                return chain.midi_chan
-        except Exception as ex:
-            logging.debug(f"Launchpad could not find the active chain: {ex}")
-        return None
+        logging.info("Launchpad keyboard off")
 
     def _launcher_note_on(self, note):
         """A launcher pad was pressed. Nothing happens until it is released,
@@ -1742,43 +2084,21 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
             logging.error(f"Launchpad could not open the pattern editor: {ex}")
             return False
 
-    def _note_mode_midi_event(self, ev, evtype):
-        """Forward the pad's notes and pressure to the chain, so the pad can
-        be played.
-
-        The channel is remembered per note at note-on, so that the note-off
-        and the pressure go to the same chain even if the active chain
-        changes while the pad is held - otherwise the note would hang.
-        """
-        if evtype not in (0x9, 0x8, 0xA, 0xD):
-            return True
-        value1 = ev[1] & 0x7F
+    def _keys_midi_event(self, ev, evtype):
+        """Route input to the keyboard."""
+        keys = self._keys
+        value1 = ev[1] & 0x7F if len(ev) > 1 else 0
         value2 = ev[2] & 0x7F if len(ev) > 2 else 0
-        if evtype == 0x9 and value2 == 0:
-            evtype = 0x8
-        if evtype == 0x9:
-            chan = self._note_mode_channel()
-            if chan is None:
-                return True
-            self._note_mode_held[value1] = chan
-        elif evtype == 0x8:
-            chan = self._note_mode_held.pop(value1, None)
-            if chan is None:
-                chan = self._note_mode_channel()
+        if evtype == 0x9 and value2 > 0:
+            keys.note_on(value1, value2)
+        elif evtype in (0x8, 0x9):
+            keys.note_off(value1)
         elif evtype == 0xA:
-            # Polyphonic pressure follows its note.
-            chan = self._note_mode_held.get(value1)
-        else:
-            # Channel pressure has a single data byte.
-            chan = self._note_mode_channel()
-            value2 = 0
-        if chan is None:
-            return True
-        status = (evtype << 4) | (chan & 0x0F)
-        try:
-            self.zynseq.libseq.sendMidiCommand(status, value1, value2)
-        except Exception as ex:
-            logging.error(f"Launchpad could not forward a note: {ex}")
+            keys.pressure(value1, value2)
+        elif evtype == 0xD:
+            keys.channel_pressure(value1)
+        elif evtype == 0xB:
+            keys.cc_change(value1, value2)
         return True
 
     def midi_event(self, ev):
@@ -1795,8 +2115,8 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
             return self._handle_layout_button(ev[1] & 0x7F)
         if self._mode == MODE_STEPSEQ and self._stepseq is not None:
             return self._stepseq_midi_event(ev, evtype)
-        if self._note_mode:
-            return self._note_mode_midi_event(ev, evtype)
+        if self._note_mode and self._keys is not None:
+            return self._keys_midi_event(ev, evtype)
         # Note ON / OFF => launch or stop a sequence on release, or open its
         # editor on a long press
         if evtype == 0x9:
