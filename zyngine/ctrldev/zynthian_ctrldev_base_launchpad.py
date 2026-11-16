@@ -56,10 +56,21 @@ Keyboard
     notes green.
     Up / Down      One octave higher / lower.
     Left / Right   One scale step lower / higher.
-    Right column   4: sustain pedal, while held.
+    Right column   3: drum chains only, drum pads / keyboard (green = drums).
+                   4: sustain pedal, while held.
     Session        Back to the launcher.
     A note's chain and pitch are fixed when its pad goes down, so it stops
     properly even if the chain or the octave changes while it is held.
+
+Drum pads
+    A chain whose synth has a drum map (Fabla, an SFZ kit with a keymap, or
+    a preset with a midnam file, such as the General MIDI kits) gets one pad
+    per sound instead of the keyboard, in four 4x4 blocks: bottom left,
+    bottom right, top left, top right, lowest note first. Pads are coloured
+    by the kind of sound, read from its name: kick red, snare orange, clap
+    pink, hi-hat yellow, tom green, cymbal cyan, other percussion purple,
+    anything else the chain's colour. A sounding pad lights white.
+    Up / Down      The next / previous 16 sounds, for kits with more than 64.
 
     The device's own Note layout isn't used, because its pads send on the
     MIDI port (IN 2), which goes straight to the chains. In Session layout
@@ -112,10 +123,12 @@ Internals
                      cursor row per sequence.
 """
 
+import os
 import json
 import logging
 import time
 from math import ceil
+from xml.dom import minidom
 from time import sleep
 from copy import deepcopy
 from threading import Thread, RLock
@@ -231,11 +244,30 @@ KEYS_ROW_SEMITONES = 5
 # The bottom-left pad starts on this note (C3), or on the scale's first note
 # from there up.
 KEYS_DEFAULT_NOTE = 48
-# Right column button 4 is the sustain pedal.
+# Right column button 3 switches a drum chain between drum pads and the
+# keyboard; button 4 is the sustain pedal.
+CC_KEYS_DRUMS = SS_RIGHT_COL_CCS[2]
 CC_SUSTAIN = SS_RIGHT_COL_CCS[3]
-# The pattern editor's scales. libseq's scale 0 is a custom keymap and 1 is
-# chromatic; scale N > 1 is entry N - 1 of this file.
-KEYS_SCALES_FPATH = "/zynthian/zynthian-data/zynseq/scales.json"
+# The pattern editor's data: scales.json, keymaps.json and the midnam drum
+# maps. libseq's scale 0 is a custom keymap and 1 is chromatic; scale N > 1
+# is entry N - 1 of scales.json.
+KEYS_DATA_DIR = "/zynthian/zynthian-data/zynseq"
+KEYS_SCALES_FPATH = KEYS_DATA_DIR + "/scales.json"
+# Drum pads come in four 4x4 blocks; Up/Down move the kit one block.
+KEYS_DRUM_BLOCK = 16
+# Drum sound families, matched in this order against the lower-case sound
+# name, and the colour each one is lit in.
+KEYS_DRUM_FAMILIES = (
+    (("kick", "bass drum", "bassdrum"), "DRUM_KICK"),
+    (("snare", "rim", "stick"), "DRUM_SNARE"),
+    (("clap", "snap"), "DRUM_CLAP"),
+    (("hat", "hh"), "DRUM_HAT"),
+    (("tom", "roto"), "DRUM_TOM"),
+    (("cymbal", "crash", "ride", "splash", "china", "cym"), "DRUM_CYMBAL"),
+    (("conga", "bongo", "cowbell", "shaker", "tamb", "clave", "block", "agogo",
+      "cabasa", "guiro", "maraca", "whistle", "triangle", "cuica", "timbale",
+      "slap", "perc", "bell"), "DRUM_PERC"),
+)
 # Pitch classes of the black keys, dimmed in the chromatic layout.
 KEYS_BLACK_KEYS = (1, 3, 6, 8, 10)
 
@@ -294,6 +326,18 @@ class COLORS:
     KEY_PRESSED = 21
     SUSTAIN = 11
     SUSTAIN_ON = 9
+    # Drum pads, by sound family; other sounds take the chain's colour.
+    DRUM_KICK = 5
+    DRUM_SNARE = 9
+    DRUM_CLAP = 53
+    DRUM_HAT = 13
+    DRUM_TOM = 17
+    DRUM_CYMBAL = 37
+    DRUM_PERC = 49
+    DRUM_PRESSED = 3
+    # Right column button 3 on a drum chain: drum pads or keyboard.
+    KEYS_DRUMS_ON = 21
+    KEYS_DRUMS_OFF = 2
 
 
 def _migrate_extras(chain):
@@ -1446,6 +1490,13 @@ class KeysHandler(ModeHandlerBase):
     A pad's "position" counts from note 0 in scale steps, or in semitones
     when chromatic. The bottom-left pad's position is the origin, which the
     arrows move.
+
+    A chain whose synth has a drum map gets drum pads instead: one pad per
+    sound, in four 4x4 blocks (bottom left, bottom right, top left, top
+    right), coloured by the kind of sound. The map comes from the synth
+    itself (Fabla, SFZ with a keymap) or from a midnam file listed in
+    keymaps.json, as in the Pattern Editor. Right column button 3 switches
+    such a chain to the keyboard and back.
     """
 
     def __init__(self, state_manager, driver):
@@ -1468,6 +1519,15 @@ class KeysHandler(ModeHandlerBase):
         self._held = {}
         # The channel the sustain pedal went down on, None while it is up.
         self._sustain_chan = None
+        # The active chain's drum map, sorted by note, or None.
+        self._drums = None
+        # What the drum map was found from, so it is only looked up again
+        # when the chain or its preset changes.
+        self._drum_src = None
+        # Index of the drum map entry on the bottom-left pad.
+        self._drum_offset = 0
+        # Chains switched from drum pads to the keyboard with button 3.
+        self._keyboard_chains = set()
 
     def end(self):
         self.release_all()
@@ -1521,6 +1581,131 @@ class KeysHandler(ModeHandlerBase):
         self._tonic = tonic
         self._origin = self._position_of(bottom)
 
+    def _load_drums(self):
+        """Look up the active chain's drum map, if its synth or preset
+        changed since the last look."""
+        chan = self._chain_chan()
+        proc = None
+        if chan is not None:
+            try:
+                proc = self._chain_manager.get_synth_processor(chan)
+            except Exception:
+                proc = None
+        src = None
+        if proc is not None:
+            try:
+                src = (chan, id(proc), proc.get_keymap_name() or proc.get_presetpath())
+            except Exception:
+                src = (chan, id(proc), None)
+        if src == self._drum_src:
+            return
+        self._drum_src = src
+        self._drum_offset = 0
+        self._drums = self._find_drum_map(proc) if proc is not None else None
+
+    def _find_drum_map(self, proc):
+        """The drum map of a synth processor, sorted by note, or None.
+
+        The same sources as the Pattern Editor's custom keymap: the synth's
+        own map, then a midnam file matched to the preset in keymaps.json.
+        """
+        keymap = None
+        try:
+            if proc.get_keymap_name():
+                keymap = proc.get_keymap()
+        except Exception as ex:
+            logging.debug(f"Launchpad can't get the synth's keymap: {ex}")
+        if not keymap:
+            keymap = self._midnam_keymap(proc)
+        entries = {}
+        for entry in keymap or ():
+            try:
+                note = int(entry["note"])
+            except Exception:
+                continue
+            if 0 <= note <= 127 and note not in entries:
+                entries[note] = {"note": note, "name": str(entry.get("name", ""))}
+        return [entries[note] for note in sorted(entries)] or None
+
+    @staticmethod
+    def _midnam_keymap(proc):
+        try:
+            preset_path = proc.get_presetpath()
+            with open(f"{KEYS_DATA_DIR}/keymaps.json") as fh:
+                patterns = json.load(fh)
+        except Exception:
+            return None
+        if not preset_path:
+            return None
+        map_name = next((name for pat, name in patterns.items() if pat in preset_path), None)
+        fpath = f"{KEYS_DATA_DIR}/{map_name}.midnam"
+        if not map_name or not os.path.isfile(fpath):
+            return None
+        try:
+            notes = minidom.parse(fpath).getElementsByTagName("Note")
+            return [{"note": int(n.attributes["Number"].value),
+                     "name": n.attributes["Name"].value} for n in notes]
+        except Exception as ex:
+            logging.error(f"Launchpad can't load the drum map '{fpath}': {ex}")
+            return None
+
+    def _drums_shown(self):
+        """True if the grid shows drum pads rather than the keyboard."""
+        if not self._drums:
+            return False
+        try:
+            chain_id = self._chain_manager.get_active_chain().chain_id
+        except Exception:
+            chain_id = None
+        return chain_id not in self._keyboard_chains
+
+    def _drum_index(self, col, prow):
+        """The drum map index of a pad: four 4x4 blocks, bottom left first,
+        then bottom right, top left and top right."""
+        block = (prow // 4) * 2 + col // 4
+        return self._drum_offset + block * KEYS_DRUM_BLOCK + (prow % 4) * 4 + col % 4
+
+    def _drum_entry(self, col, prow):
+        index = self._drum_index(col, prow)
+        if 0 <= index < len(self._drums):
+            return self._drums[index]
+        return None
+
+    def _max_drum_offset(self):
+        extra = len(self._drums or ()) - 4 * KEYS_DRUM_BLOCK
+        return max(0, ceil(extra / KEYS_DRUM_BLOCK) * KEYS_DRUM_BLOCK)
+
+    def _shift_drums(self, delta):
+        with self._lock:
+            offset = self._drum_offset + delta
+            if 0 <= offset <= self._max_drum_offset():
+                self._drum_offset = offset
+                self.refresh()
+
+    def _toggle_drums(self):
+        with self._lock:
+            if not self._drums:
+                return
+            try:
+                chain_id = self._chain_manager.get_active_chain().chain_id
+            except Exception:
+                return
+            # Stop what is sounding: its pads are about to mean other notes.
+            self.release_all()
+            if chain_id in self._keyboard_chains:
+                self._keyboard_chains.discard(chain_id)
+            else:
+                self._keyboard_chains.add(chain_id)
+            self.refresh()
+
+    @staticmethod
+    def _drum_family_colour(name):
+        name = name.lower()
+        for words, colour in KEYS_DRUM_FAMILIES:
+            if any(word in name for word in words):
+                return getattr(COLORS, colour)
+        return None
+
     def _note_at(self, position):
         if self._intervals is None:
             return position
@@ -1544,7 +1729,10 @@ class KeysHandler(ModeHandlerBase):
 
     def _pad_note(self, col, prow):
         """The note of a pad, by column and row from the bottom, or None if
-        it is outside the MIDI range."""
+        it plays nothing."""
+        if self._drums_shown():
+            entry = self._drum_entry(col, prow)
+            return entry["note"] if entry is not None else None
         note = self._note_at(self._origin + col + prow * self._row_step())
         return note if 0 <= note <= 127 else None
 
@@ -1654,7 +1842,14 @@ class KeysHandler(ModeHandlerBase):
             return
         if ccval == 0:
             return
-        if ccnum == CC_UP:
+        if ccnum == CC_KEYS_DRUMS:
+            self._toggle_drums()
+        elif self._drums_shown():
+            if ccnum == CC_UP:
+                self._shift_drums(KEYS_DRUM_BLOCK)
+            elif ccnum == CC_DOWN:
+                self._shift_drums(-KEYS_DRUM_BLOCK)
+        elif ccnum == CC_UP:
             self._shift(self._octave_step())
         elif ccnum == CC_DOWN:
             self._shift(-self._octave_step())
@@ -1671,6 +1866,7 @@ class KeysHandler(ModeHandlerBase):
                 return
             if force:
                 self._leds.forget()
+            self._load_drums()
             self._load_layout()
             self._render_grid()
             self._render_controls()
@@ -1692,16 +1888,28 @@ class KeysHandler(ModeHandlerBase):
             return COLORS.KEY_BLACK
         return COLORS.KEY
 
+    def _drum_colour(self, entry, sounding, chain_colour):
+        if entry is None:
+            return COLORS.OFF
+        if entry["note"] in sounding:
+            return COLORS.DRUM_PRESSED
+        colour = self._drum_family_colour(entry["name"])
+        return chain_colour if colour is None else colour
+
     def _render_grid(self):
         if not self._is_active:
             return
         # A note can be on more than one pad; all of them light while it sounds.
         sounding = {note for _, note in self._held.values()}
         root_colour = self._root_colour()
+        drums = self._drums_shown()
         for prow in range(8):
             for col in range(8):
                 pad = 10 * (prow + 1) + col + 1
-                colour = self._pad_colour(self._pad_note(col, prow), sounding, root_colour)
+                if drums:
+                    colour = self._drum_colour(self._drum_entry(col, prow), sounding, root_colour)
+                else:
+                    colour = self._pad_colour(self._pad_note(col, prow), sounding, root_colour)
                 if colour == COLORS.OFF:
                     self._leds.pad_off(pad)
                 else:
@@ -1710,13 +1918,21 @@ class KeysHandler(ModeHandlerBase):
     def _render_controls(self):
         if not self._is_active:
             return
-        octave, step = self._octave_step(), 1
-        lit = {
-            CC_UP: self._can_shift(octave),
-            CC_DOWN: self._can_shift(-octave),
-            CC_RIGHT: self._can_shift(step),
-            CC_LEFT: self._can_shift(-step),
-        }
+        if self._drums_shown():
+            lit = {
+                CC_UP: self._drum_offset < self._max_drum_offset(),
+                CC_DOWN: self._drum_offset > 0,
+                CC_RIGHT: False,
+                CC_LEFT: False,
+            }
+        else:
+            octave, step = self._octave_step(), 1
+            lit = {
+                CC_UP: self._can_shift(octave),
+                CC_DOWN: self._can_shift(-octave),
+                CC_RIGHT: self._can_shift(step),
+                CC_LEFT: self._can_shift(-step),
+            }
         for ccnum, on in lit.items():
             if on:
                 self._leds.cc_on(ccnum, COLORS.ARROW)
@@ -1726,6 +1942,9 @@ class KeysHandler(ModeHandlerBase):
             if ccnum == CC_SUSTAIN:
                 self._leds.cc_on(ccnum, COLORS.SUSTAIN_ON if self._sustain_chan is not None
                                  else COLORS.SUSTAIN)
+            elif ccnum == CC_KEYS_DRUMS and self._drums:
+                self._leds.cc_on(ccnum, COLORS.KEYS_DRUMS_ON if self._drums_shown()
+                                 else COLORS.KEYS_DRUMS_OFF)
             else:
                 self._leds.cc_off(ccnum)
         self._leds.cc_off(self._driver.cc_back)
