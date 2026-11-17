@@ -58,9 +58,21 @@ Keyboard
     Left / Right   One scale step lower / higher.
     Right column   3: drum chains only, drum pads / keyboard (green = drums).
                    4: sustain pedal, while held.
-    Session        Back to the launcher.
+    Session        Back to the launcher, or to the step sequencer.
     A note's chain and pitch are fixed when its pad goes down, so it stops
     properly even if the chain or the octave changes while it is held.
+
+Keyboard over the Pattern Editor (Note pressed in the step sequencer)
+    The keyboard plays the edited pattern's chain and can record into it.
+    Right column   1: play / stop the pattern.
+                   2: record, the editor's own record button (red, pulsing
+                      while armed).
+    While playing, a recorded note goes in at the nearest step, as long as
+    it was held, in whole steps. While stopped, notes are entered a step at
+    a time at the playhead, as from a MIDI keyboard: a note adds a one-step
+    note (or removes the one already there) and moves on a step. While
+    sustain is held, notes stack into a chord and lifting it moves on.
+    Leaving the editor on the screen goes back to the launcher.
 
 Drum pads
     A chain whose synth has a drum map (Fabla, an SFZ kit with a keymap, or
@@ -98,6 +110,7 @@ Step sequencer (Pattern Editor open)
                    7: follow the playhead on / off (bright blue when on).
                    8: tap to undo, long press to redo.
     Capture MIDI   BACK.
+    Note           The keyboard, over the editor (above).
     Session        Back to the launcher.
 
     Colours: a note's first step runs from dim green to white with velocity,
@@ -118,6 +131,11 @@ Internals
                      state. Every 7th poll it also checks for a different
                      pattern, keymap, length or sequence on the screen, and
                      repaints, so touchscreen edits appear on the pad.
+    KeysHandler      The keyboard and drum pads. Over the editor it records
+                     by writing notes through libseq itself: libseq only
+                     records its JACK input, and the notes the driver plays
+                     go out of its output. A 100 ms poll follows the
+                     editor's record button, the play state and the scale.
     ArrowRepeater    Generates the key repeat for held Up/Down arrows.
     StepSeqState     Saved in the snapshot: the brush per chain, and the
                      cursor row per sequence.
@@ -248,6 +266,13 @@ KEYS_DEFAULT_NOTE = 48
 # keyboard; button 4 is the sustain pedal.
 CC_KEYS_DRUMS = SS_RIGHT_COL_CCS[2]
 CC_SUSTAIN = SS_RIGHT_COL_CCS[3]
+# Over the Pattern Editor, buttons 1 and 2 play / stop the edited pattern
+# and arm recording into it.
+CC_KEYS_PLAY = SS_RIGHT_COL_CCS[0]
+CC_KEYS_RECORD = SS_RIGHT_COL_CCS[1]
+# How often the keyboard over the editor looks at the editor's record
+# button, the play state and the pattern's scale, in seconds.
+KEYS_POLL_INTERVAL = 0.1
 # The pattern editor's data: scales.json, keymaps.json and the midnam drum
 # maps. libseq's scale 0 is a custom keymap and 1 is chromatic; scale N > 1
 # is entry N - 1 of scales.json.
@@ -338,6 +363,9 @@ class COLORS:
     # Right column button 3 on a drum chain: drum pads or keyboard.
     KEYS_DRUMS_ON = 21
     KEYS_DRUMS_OFF = 2
+    # Right column button 2 over the editor: record armed (pulsing) or not.
+    RECORD = 7
+    RECORD_ON = 5
 
 
 def _migrate_extras(chain):
@@ -583,6 +611,69 @@ class FeedbackLEDs:
 # ------------------------------------------------------------------------------------------------------------------
 # Step sequencer mode handler
 # ------------------------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------------------------
+# The on-screen Pattern Editor
+# ------------------------------------------------------------------------------------------------------------------
+#
+# The pad and the screen are two views of the same pattern. These reach into
+# the GUI directly, which the Zynthian codebase already does from
+# ModeHandlerBase (_get_selected_step) and from the Launchpad Pro MK2 driver.
+# Every call is best-effort: the driver must keep working if the screen is
+# elsewhere or if the UI changes shape.
+
+def _shown_pattern_editor():
+    """The on-screen pattern editor, or None when it is not the current screen."""
+    try:
+        zyngui = zynthian_gui_config.zyngui
+        if zyngui is None or zyngui.current_screen != "pattern_editor":
+            return None
+        return zyngui.screens.get("pattern_editor")
+    except Exception as ex:
+        logging.debug(f"Launchpad pattern editor unavailable: {ex}")
+        return None
+
+
+def _flag_pattern_changed():
+    """Tell the pattern editor its pattern was edited, so undo can see it.
+
+    The pattern editor keeps libseq's undo stack by flagging itself changed
+    and letting refresh_status() push a snapshot on its own timer. The
+    driver writes notes straight through libseq, bypassing that flag, so
+    without this its edits never reach the snapshot stack: undo appears to
+    do nothing, and redo has nothing to restore. Setting the flag is enough
+    - the GUI batches its own snapshots by SAVE_SNAPSHOT_DELAY, and ours
+    follow the same rhythm, so a burst of pad presses undoes as one step.
+
+    The reference APC driver has this same gap, with savePatternSnapshot()
+    commented out.
+    """
+    try:
+        zyngui = zynthian_gui_config.zyngui
+        if zyngui is not None:
+            patted = zyngui.screens.get("pattern_editor")
+            if patted is not None:
+                patted.changed = True
+    except Exception as ex:
+        logging.debug(f"Launchpad could not flag the pattern as changed: {ex}")
+
+
+def _write_note(libseq, step, note, velocity, duration, offset=0.0):
+    """Add a note to the selected pattern with the editor's default note
+    data (play chance, stutter...), so that a note entered on the pad is
+    the same as one entered on the screen."""
+    libseq.addNote(step, note, velocity, duration, offset)
+    pe = _shown_pattern_editor()
+    if pe is not None:
+        try:
+            evdata = pe.get_default_note_evdata()
+            # setNoteData overwrites the velocity, but not the start,
+            # offset or duration; keep the velocity given.
+            evdata.val2_start = velocity
+            libseq.setNoteData(step, note, evdata)
+        except Exception as ex:
+            logging.debug(f"Launchpad could not set the note data: {ex}")
+
+
 class StepSeqHandler(ModeHandlerBase):
     """Piano-roll step sequencer.
 
@@ -1138,47 +1229,12 @@ class StepSeqHandler(ModeHandlerBase):
         self._render_grid()
 
     # ----- on-screen pattern editor ---------------------------------------
-    #
-    # The pad and the screen are two views of the same piano roll, so the
-    # driver only has to tell the screen where the cursor is. This reaches
-    # into the GUI directly, which the Zynthian codebase already does from
-    # ModeHandlerBase (_get_selected_step) and from the Launchpad Pro MK2
-    # driver. Every call is best-effort: the driver must keep working if the
-    # screen is elsewhere or if the UI changes shape.
 
     def _pattern_editor(self):
-        """The on-screen pattern editor, or None when it is not the current screen."""
-        try:
-            zyngui = zynthian_gui_config.zyngui
-            if zyngui is None or zyngui.current_screen != "pattern_editor":
-                return None
-            return zyngui.screens.get("pattern_editor")
-        except Exception as ex:
-            logging.debug(f"Launchpad pattern editor unavailable: {ex}")
-            return None
+        return _shown_pattern_editor()
 
     def _mark_pattern_changed(self):
-        """Tell the pattern editor its pattern was edited, so undo can see it.
-
-        The pattern editor keeps libseq's undo stack by flagging itself changed
-        and letting refresh_status() push a snapshot on its own timer. The
-        driver writes notes straight through libseq, bypassing that flag, so
-        without this its edits never reach the snapshot stack: undo appears to
-        do nothing, and redo has nothing to restore. Setting the flag is enough
-        - the GUI batches its own snapshots by SAVE_SNAPSHOT_DELAY, and ours
-        follow the same rhythm, so a burst of pad presses undoes as one step.
-
-        The reference APC driver has this same gap, with savePatternSnapshot()
-        commented out.
-        """
-        try:
-            zyngui = zynthian_gui_config.zyngui
-            if zyngui is not None:
-                patted = zyngui.screens.get("pattern_editor")
-                if patted is not None:
-                    patted.changed = True
-        except Exception as ex:
-            logging.debug(f"Launchpad could not flag the pattern as changed: {ex}")
+        _flag_pattern_changed()
 
     # ----- sequencer operations -----------------------------------------
 
@@ -1220,17 +1276,7 @@ class StepSeqHandler(ModeHandlerBase):
         data (play chance, stutter...), so that a note entered on the pad is
         the same as one entered on the screen. Returns the duration used."""
         duration = self._clamp_duration(step, note, duration)
-        velocity = self._brush_velocity
-        self._libseq.addNote(step, note, velocity, duration, 0)
-        pe = self._pattern_editor()
-        if pe is not None:
-            try:
-                evdata = pe.get_default_note_evdata()
-                # setNoteData overwrites the velocity; keep the brush's.
-                evdata.val2_start = velocity
-                self._libseq.setNoteData(step, note, evdata)
-            except Exception as ex:
-                logging.debug(f"Launchpad could not set the note data: {ex}")
+        _write_note(self._libseq, step, note, self._brush_velocity, duration)
         return duration
 
     def _audition(self, note, duration):
@@ -1497,6 +1543,14 @@ class KeysHandler(ModeHandlerBase):
     itself (Fabla, SFZ with a keymap) or from a midnam file listed in
     keymaps.json, as in the Pattern Editor. Right column button 3 switches
     such a chain to the keyboard and back.
+
+    Opened over the Pattern Editor, the keyboard plays the edited
+    sequence's chain instead, and can record into its pattern: button 1
+    plays / stops it and button 2 is the editor's own record button. While
+    the pattern plays, a note goes in at the step nearest to where it was
+    played, as long as it was held, in whole steps. While it is stopped,
+    notes are entered a step at a time at the playhead, like libseq's own
+    step capture from a MIDI keyboard: see _step_entry().
     """
 
     def __init__(self, state_manager, driver):
@@ -1528,21 +1582,41 @@ class KeysHandler(ModeHandlerBase):
         self._drum_offset = 0
         # Chains switched from drum pads to the keyboard with button 3.
         self._keyboard_chains = set()
+        # The edited sequence, (phrase, chan), while the keyboard is open
+        # over the Pattern Editor; None over the launcher.
+        self._seq = None
+        # Notes being recorded while the pattern plays, by pad:
+        # (note, velocity, the sequence's play position at note-on in clocks).
+        self._takes = {}
+        # What the play and record buttons show, read by the poll.
+        self._playing = False
+        self._recording = False
+        # Over the editor, follows its record button, the play state, the
+        # pattern's scale and the sequence being edited.
+        self._poll = PlayheadMonitor(self._poll_editor, KEYS_POLL_INTERVAL)
 
     def end(self):
+        self._poll.set_enabled(False)
+        self._poll.end()
         self.release_all()
 
-    def set_active(self, active):
+    def set_active(self, active, seq=None):
+        """Show or hide the keyboard. seq is the edited sequence when it is
+        opened over the Pattern Editor."""
         with self._lock:
             if active:
+                self._seq = seq
                 super().set_active(True)
                 # The device was cleared by the driver, so forget what was lit.
                 self._leds.forget()
+                self._read_editor_state()
                 self.refresh()
             else:
                 self.release_all()
                 super().set_active(False)
                 self._leds.all_off()
+                self._seq = None
+        self._poll.set_enabled(active and seq is not None)
 
     # ----- layout ----------------------------------------------------------
 
@@ -1653,11 +1727,7 @@ class KeysHandler(ModeHandlerBase):
         """True if the grid shows drum pads rather than the keyboard."""
         if not self._drums:
             return False
-        try:
-            chain_id = self._chain_manager.get_active_chain().chain_id
-        except Exception:
-            chain_id = None
-        return chain_id not in self._keyboard_chains
+        return self._chain_id() not in self._keyboard_chains
 
     def _drum_index(self, col, prow):
         """The drum map index of a pad: four 4x4 blocks, bottom left first,
@@ -1684,11 +1754,8 @@ class KeysHandler(ModeHandlerBase):
 
     def _toggle_drums(self):
         with self._lock:
-            if not self._drums:
-                return
-            try:
-                chain_id = self._chain_manager.get_active_chain().chain_id
-            except Exception:
+            chain_id = self._chain_id()
+            if not self._drums or chain_id is None:
                 return
             # Stop what is sounding: its pads are about to mean other notes.
             self.release_all()
@@ -1757,15 +1824,28 @@ class KeysHandler(ModeHandlerBase):
     # ----- playing -----------------------------------------------------------
 
     def _chain_chan(self):
-        """The MIDI channel of the active chain, or None if it has none it
-        can be played on."""
+        """The MIDI channel the keyboard plays: the edited sequence's over
+        the Pattern Editor, the active chain's otherwise. None if there is
+        none it can be played on."""
         try:
-            chan = self._chain_manager.get_active_chain().midi_chan
+            if self._seq is not None:
+                chan = self._libseq.getChannel(self._zynseq.scene, *self._seq, 0)
+            else:
+                chan = self._chain_manager.get_active_chain().midi_chan
         except Exception:
             return None
         if isinstance(chan, int) and 0 <= chan < MAX_NUM_MIDI_CHANS:
             return chan
         return None
+
+    def _chain_id(self):
+        """The id of the chain the keyboard plays, or None."""
+        try:
+            if self._seq is not None:
+                return self._get_chain_id_by_sequence(*self._seq)
+            return self._chain_manager.get_active_chain().chain_id
+        except Exception:
+            return None
 
     def _send(self, status, value1, value2=0):
         try:
@@ -1784,6 +1864,8 @@ class KeysHandler(ModeHandlerBase):
                 return
             self._held[pad] = (chan, note)
             self._send(0x90 | chan, note, velocity)
+            if self._seq is not None:
+                self._record_note_on(pad, note, velocity)
             self._render_grid()
 
     def note_off(self, pad, shifted_override=None):
@@ -1793,6 +1875,7 @@ class KeysHandler(ModeHandlerBase):
                 return
             chan, note = held
             self._send(0x80 | chan, note, 0)
+            self._record_note_off(pad)
             self._render_grid()
 
     def pressure(self, pad, value):
@@ -1824,12 +1907,17 @@ class KeysHandler(ModeHandlerBase):
                     return
                 self._send(0xB0 | self._sustain_chan, 64, 0)
                 self._sustain_chan = None
+                # In step entry, lifting the pedal moves on to the next step.
+                if self._is_recording() and not self._seq_playing():
+                    self._advance_step()
             self._render_controls()
 
     def release_all(self):
         """Stop every sounding note, and lift the sustain pedal."""
         with self._lock:
             held, self._held = self._held, {}
+            # Notes cut short are not recorded.
+            self._takes.clear()
             for chan, note in held.values():
                 self._send(0x80 | chan, note, 0)
             if self._sustain_chan is not None:
@@ -1841,6 +1929,13 @@ class KeysHandler(ModeHandlerBase):
             self._sustain(ccval > 0)
             return
         if ccval == 0:
+            return
+        if ccnum in (CC_KEYS_PLAY, CC_KEYS_RECORD):
+            if self._seq is not None:
+                if ccnum == CC_KEYS_PLAY:
+                    self._toggle_play()
+                else:
+                    self._toggle_record()
             return
         if ccnum == CC_KEYS_DRUMS:
             self._toggle_drums()
@@ -1857,6 +1952,157 @@ class KeysHandler(ModeHandlerBase):
             self._shift(1)
         elif ccnum == CC_LEFT:
             self._shift(-1)
+
+    # ----- over the Pattern Editor: playing and recording --------------------
+
+    def _seq_playing(self):
+        try:
+            return self._libseq.getPlayState(self._zynseq.scene, *self._seq) != zynseq.SEQ_STOPPED
+        except Exception:
+            return False
+
+    def _is_recording(self):
+        """True if notes played go into the edited pattern."""
+        if self._seq is None:
+            return False
+        try:
+            return bool(self._libseq.isMidiRecord())
+        except Exception:
+            return False
+
+    def _play_position(self):
+        return self._libseq.getSequencePlayPosition(self._zynseq.scene, *self._seq)
+
+    def _pattern_clocks(self):
+        """The edited pattern's length in steps and its clocks per step, or
+        None if there is no pattern."""
+        try:
+            steps = self._libseq.getSteps()
+            per_step = self._libseq.getClocksPerStep(self._libseq.getPatternIndex())
+        except Exception:
+            return None
+        if steps <= 0 or per_step <= 0:
+            return None
+        return steps, per_step
+
+    def _toggle_play(self):
+        try:
+            self._libseq.togglePlayState(self._zynseq.scene, *self._seq)
+        except Exception as ex:
+            logging.error(f"Launchpad could not play the pattern: {ex}")
+
+    def _toggle_record(self):
+        """Press the editor's own record button. It is only sent while the
+        editor is on screen: anywhere else the same action records audio.
+        The button's light follows libseq, through the poll."""
+        if _shown_pattern_editor() is not None:
+            self._state_manager.send_cuia("TOGGLE_RECORD")
+
+    def _record_note_on(self, pad, note, velocity):
+        if not self._is_recording():
+            return
+        if self._seq_playing():
+            try:
+                self._takes[pad] = (note, velocity, self._play_position())
+            except Exception as ex:
+                logging.error(f"Launchpad could not read the play position: {ex}")
+        else:
+            self._step_entry(note, velocity)
+
+    def _record_note_off(self, pad):
+        """A note recorded while playing goes in at the nearest step, as
+        long as it was held, rounded to whole steps (at least one), and
+        never past the end of the pattern."""
+        take = self._takes.pop(pad, None)
+        if take is None:
+            return
+        clocks = self._pattern_clocks()
+        if clocks is None:
+            return
+        note, velocity, start_clock = take
+        steps, per_step = clocks
+        start = int(start_clock / per_step + 0.5) % steps
+        duration = 1
+        if self._seq_playing():
+            try:
+                # The pattern loops, so the release can come before the press.
+                held = (self._play_position() - start_clock) % (steps * per_step)
+                duration = max(1, int(held / per_step + 0.5))
+            except Exception:
+                pass
+        duration = min(duration, steps - start)
+        _write_note(self._libseq, start, note, velocity, float(duration))
+        _flag_pattern_changed()
+
+    def _step_entry(self, note, velocity):
+        """Enter a note at the playhead while the pattern is stopped.
+
+        This does what libseq does with a MIDI keyboard's notes, so both
+        keyboards enter notes the same way, at the playhead the editor shows:
+        - A note adds a one-step note and moves on a step. If the note is
+          already there, it is removed instead, and the step still moves on.
+        - While sustain (button 4) is held, notes don't move on, so they
+          build a chord, and a note played again grows a step longer.
+          Lifting sustain moves on.
+        """
+        clocks = self._pattern_clocks()
+        if clocks is None:
+            return
+        steps = clocks[0]
+        try:
+            step = self._libseq.getPatternPlayhead() % steps
+            duration = int(self._libseq.getNoteDuration(step, note))
+            if self._sustain_chan is not None:
+                _write_note(self._libseq, step, note, velocity,
+                            float(min(duration + 1, steps - step)))
+            else:
+                if duration:
+                    self._libseq.removeNote(step, note)
+                else:
+                    _write_note(self._libseq, step, note, velocity, 1.0)
+                self._advance_step()
+        except Exception as ex:
+            logging.error(f"Launchpad could not enter a note: {ex}")
+            return
+        _flag_pattern_changed()
+
+    def _advance_step(self):
+        """Move the stopped playhead on a step, wrapping at the end."""
+        clocks = self._pattern_clocks()
+        if clocks is None:
+            return
+        steps, per_step = clocks
+        try:
+            step = (self._libseq.getPatternPlayhead() + 1) % steps
+            self._libseq.setSequencePlayPosition(
+                self._zynseq.scene, *self._seq, step * per_step)
+        except Exception as ex:
+            logging.error(f"Launchpad could not move the playhead: {ex}")
+
+    def _read_editor_state(self):
+        if self._seq is None:
+            self._playing = self._recording = False
+            return
+        self._playing = self._seq_playing()
+        self._recording = self._is_recording()
+
+    def _poll_editor(self):
+        """Called from the poll thread while the keyboard is over the editor."""
+        with self._lock:
+            if not self._is_active or self._seq is None:
+                return
+            try:
+                seq = (self._zynseq.phrase, self._zynseq.chan)
+            except Exception:
+                seq = self._seq
+            if seq != self._seq:
+                # The editor moved to another sequence, maybe on another
+                # chain: stop what the old one was playing.
+                self.release_all()
+                self._seq = seq
+            self._read_editor_state()
+            # The LED cache only sends what changed.
+            self.refresh()
 
     # ----- painting ----------------------------------------------------------
 
@@ -1939,7 +2185,13 @@ class KeysHandler(ModeHandlerBase):
             else:
                 self._leds.cc_off(ccnum)
         for ccnum in SS_RIGHT_COL_CCS:
-            if ccnum == CC_SUSTAIN:
+            if ccnum == CC_KEYS_PLAY and self._seq is not None:
+                self._leds.cc_on(ccnum, COLORS.TRANSPORT_ACTIVE if self._playing
+                                 else COLORS.TRANSPORT, 2 if self._playing else 0)
+            elif ccnum == CC_KEYS_RECORD and self._seq is not None:
+                self._leds.cc_on(ccnum, COLORS.RECORD_ON if self._recording
+                                 else COLORS.RECORD, 2 if self._recording else 0)
+            elif ccnum == CC_SUSTAIN:
                 self._leds.cc_on(ccnum, COLORS.SUSTAIN_ON if self._sustain_chan is not None
                                  else COLORS.SUSTAIN)
             elif ccnum == CC_KEYS_DRUMS and self._drums:
@@ -2062,6 +2314,10 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
                 self._exit_note_mode(refresh=False)
             self._stepseq.set_active(True)
         else:
+            if self._note_mode:
+                # The keyboard was over the editor, which has gone: back to
+                # the launcher.
+                self._exit_note_mode(refresh=False)
             self._stepseq.set_active(False)
             # The handler cleared its own LEDs; wipe the device state and repaint
             # the launcher, otherwise the grid would stay dark until the next event.
@@ -2090,14 +2346,15 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
     # ----- signal routing -------------------------------------------------
 
     def refresh(self):
-        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+        # The keyboard can be over either mode, so it comes first.
+        if self._note_mode and self._keys is not None:
             # Only the base refresh (chain list); skip the launcher repaint.
             zynthian_ctrldev_base.refresh(self)
-            self._stepseq.refresh()
-            return
-        if self._note_mode and self._keys is not None:
-            zynthian_ctrldev_base.refresh(self)
             self._keys.refresh()
+            return
+        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+            zynthian_ctrldev_base.refresh(self)
+            self._stepseq.refresh()
             return
         super().refresh()
 
@@ -2108,10 +2365,11 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
             self._keys.refresh()
 
     def update_seq_state(self, phrase, chan):
+        if self._note_mode:
+            # The keyboard over the editor polls the play state itself.
+            return
         if self._mode == MODE_STEPSEQ and self._stepseq is not None:
             self._stepseq.update_seq_state(phrase, chan)
-            return
-        if self._note_mode:
             return
         super().update_seq_state(phrase, chan)
 
@@ -2193,24 +2451,28 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         dispatch - otherwise a pad press in the wrong layout means something
         entirely different.
 
-        In the pattern editor, Session means "go back to the launcher". In the
-        launcher, Note means "play the instrument": the device goes back to
-        its Session layout and the driver draws the keyboard. Custom is not a
-        layout this driver paints, so it always falls back to Session.
+        Note means "play the instrument": the device goes back to its Session
+        layout and the driver draws the keyboard, over the launcher or over
+        the step sequencer. On the keyboard, Session goes back to what was
+        under it; in the step sequencer, it goes back to the launcher.
+        Custom is not a layout this driver paints, so it always falls back
+        to Session.
         """
-        if self._mode == MODE_STEPSEQ:
-            if ccnum == self.cc_session:
-                self._restore_session_layout()
-                # Back to the launcher, with the device in its Session layout.
-                self.state_manager.send_cuia("SCREEN_ZYNPAD")
-            else:
-                self._restore_session_layout()
-            return True
         if self._note_mode:
             # Only Session leaves note mode; the others are not layouts the
             # driver paints.
             if ccnum == self.cc_session:
                 self._exit_note_mode()
+            else:
+                self._restore_session_layout()
+            return True
+        if self._mode == MODE_STEPSEQ:
+            if ccnum == self.cc_session:
+                self._restore_session_layout()
+                # Back to the launcher, with the device in its Session layout.
+                self.state_manager.send_cuia("SCREEN_ZYNPAD")
+            elif ccnum == self.cc_note:
+                self._enter_note_mode()
             else:
                 self._restore_session_layout()
             return True
@@ -2221,7 +2483,8 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         return True
 
     def _enter_note_mode(self):
-        """Turn the grid into a keyboard for the active chain.
+        """Turn the grid into a keyboard: for the active chain over the
+        launcher, for the edited sequence over the step sequencer.
 
         Pressing Note has already switched the device to its own Note
         layout, whose pads send on the MIDI port, where this driver doesn't
@@ -2231,21 +2494,30 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         """
         if self.idev_out is None or self._keys is None:
             return False
+        seq = None
+        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+            seq = self._stepseq._selected_seq
+            self._stepseq.set_active(False)
         self._note_mode = True
         self.send_sysex(self.sysex_layout_session)
         self.light_off()
-        self._keys.set_active(True)
+        self._keys.set_active(True, seq)
         logging.info("Launchpad keyboard on")
         return True
 
     def _exit_note_mode(self, refresh=True):
         """Back from the keyboard. Sounding notes are stopped, and with
-        refresh the launcher is repainted."""
+        refresh what was under it is shown again: the step sequencer if the
+        editor is still open, the launcher otherwise."""
         self._note_mode = False
         if self._keys is not None:
             self._keys.set_active(False)
         if refresh:
-            self._restore_session_layout()
+            if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+                self.send_sysex(self.sysex_layout_session)
+                self._stepseq.set_active(True)
+            else:
+                self._restore_session_layout()
         logging.info("Launchpad keyboard off")
 
     def _launcher_note_on(self, note):
@@ -2332,10 +2604,10 @@ class zynthian_ctrldev_launchpad_base(zynthian_ctrldev_zynpad):
         if evtype == 0xB and (ev[2] & 0x7F) > 0 and (ev[1] & 0x7F) in self.layout_button_ccs:
             logging.debug(f"Layout button {ev[1] & 0x7F} pressed")
             return self._handle_layout_button(ev[1] & 0x7F)
-        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
-            return self._stepseq_midi_event(ev, evtype)
         if self._note_mode and self._keys is not None:
             return self._keys_midi_event(ev, evtype)
+        if self._mode == MODE_STEPSEQ and self._stepseq is not None:
+            return self._stepseq_midi_event(ev, evtype)
         # Note ON / OFF => launch or stop a sequence on release, or open its
         # editor on a long press
         if evtype == 0x9:
