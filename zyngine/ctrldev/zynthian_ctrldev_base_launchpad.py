@@ -270,9 +270,12 @@ CC_SUSTAIN = SS_RIGHT_COL_CCS[3]
 # and arm recording into it.
 CC_KEYS_PLAY = SS_RIGHT_COL_CCS[0]
 CC_KEYS_RECORD = SS_RIGHT_COL_CCS[1]
-# How often the keyboard over the editor looks at the editor's record
-# button, the play state and the pattern's scale, in seconds.
-KEYS_POLL_INTERVAL = 0.1
+# The keyboard over the editor polls the playhead as often as the step
+# sequencer does, so the pads can echo the pattern's notes, and looks at
+# the editor's record button, the play state and the pattern's scale every
+# KEYS_SYNC_EVERY polls (about every 100 ms).
+KEYS_POLL_INTERVAL = SS_PLAYHEAD_INTERVAL
+KEYS_SYNC_EVERY = 7
 # The pattern editor's data: scales.json, keymaps.json and the midnam drum
 # maps. libseq's scale 0 is a custom keymap and 1 is chromatic; scale N > 1
 # is entry N - 1 of scales.json.
@@ -349,6 +352,8 @@ class COLORS:
     KEY = 2
     KEY_BLACK = 1
     KEY_PRESSED = 21
+    # A note the edited pattern is playing, on the keyboard or drum pads.
+    KEY_ECHO = 45
     SUSTAIN = 11
     SUSTAIN_ON = 9
     # Drum pads, by sound family; other sounds take the chain's colour.
@@ -1551,6 +1556,10 @@ class KeysHandler(ModeHandlerBase):
     played, as long as it was held, in whole steps. While it is stopped,
     notes are entered a step at a time at the playhead, like libseq's own
     step capture from a MIDI keyboard: see _step_entry().
+
+    While the edited pattern plays, the pads of the notes sounding at its
+    playhead light up (the "echo"), so the pattern can be followed, and
+    played along with, on the pads.
     """
 
     def __init__(self, state_manager, driver):
@@ -1591,6 +1600,11 @@ class KeysHandler(ModeHandlerBase):
         # What the play and record buttons show, read by the poll.
         self._playing = False
         self._recording = False
+        # The notes on the grid the edited pattern is playing at its
+        # playhead, and the step they were read at (None to read again).
+        self._echo = frozenset()
+        self._echo_step = None
+        self._poll_count = 0
         # Over the editor, follows its record button, the play state, the
         # pattern's scale and the sequence being edited.
         self._poll = PlayheadMonitor(self._poll_editor, KEYS_POLL_INTERVAL)
@@ -1616,6 +1630,7 @@ class KeysHandler(ModeHandlerBase):
                 super().set_active(False)
                 self._leds.all_off()
                 self._seq = None
+                self._echo, self._echo_step = frozenset(), None
         self._poll.set_enabled(active and seq is not None)
 
     # ----- layout ----------------------------------------------------------
@@ -2100,9 +2115,45 @@ class KeysHandler(ModeHandlerBase):
                 # chain: stop what the old one was playing.
                 self.release_all()
                 self._seq = seq
-            self._read_editor_state()
-            # The LED cache only sends what changed.
-            self.refresh()
+                self._poll_count = 0
+            if self._poll_count == 0:
+                self._read_editor_state()
+                # The LED cache only sends what changed.
+                self.refresh()
+            elif self._update_echo():
+                self._render_grid()
+            self._poll_count = (self._poll_count + 1) % KEYS_SYNC_EVERY
+
+    def _update_echo(self, force=False):
+        """Read which of the grid's notes the edited pattern is playing.
+        They are read again when the playhead moves on a step, or if force
+        is set. Returns True if they changed."""
+        step = None
+        if self._seq is not None and self._seq_playing():
+            try:
+                step = int(self._libseq.getPatternPlayhead())
+                if not 0 <= step < self._libseq.getSteps():
+                    step = None
+            except Exception:
+                step = None
+        if step == self._echo_step and not force:
+            return False
+        self._echo_step = step
+        echo = set()
+        if step is not None:
+            shown = {self._pad_note(col, prow) for prow in range(8) for col in range(8)}
+            shown.discard(None)
+            try:
+                # getNoteStart finds a note covering the step, so a long
+                # note stays lit for as long as it sounds.
+                echo = {note for note in shown if self._libseq.getNoteStart(step, note) != -1}
+            except Exception:
+                echo = set()
+        echo = frozenset(echo)
+        if echo == self._echo:
+            return False
+        self._echo = echo
+        return True
 
     # ----- painting ----------------------------------------------------------
 
@@ -2114,6 +2165,8 @@ class KeysHandler(ModeHandlerBase):
                 self._leds.forget()
             self._load_drums()
             self._load_layout()
+            # The layout may have moved, or the pattern been edited.
+            self._update_echo(force=True)
             self._render_grid()
             self._render_controls()
 
@@ -2128,6 +2181,8 @@ class KeysHandler(ModeHandlerBase):
             return COLORS.OFF
         if note in sounding:
             return COLORS.KEY_PRESSED
+        if note in self._echo:
+            return COLORS.KEY_ECHO
         if (note - self._tonic) % 12 == 0:
             return root_colour
         if self._intervals is None and note % 12 in KEYS_BLACK_KEYS:
@@ -2139,6 +2194,8 @@ class KeysHandler(ModeHandlerBase):
             return COLORS.OFF
         if entry["note"] in sounding:
             return COLORS.DRUM_PRESSED
+        if entry["note"] in self._echo:
+            return COLORS.KEY_ECHO
         colour = self._drum_family_colour(entry["name"])
         return chain_colour if colour is None else colour
 
