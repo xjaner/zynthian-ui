@@ -1089,7 +1089,10 @@ def get_plugin_ports(plugin_url):
             #logging.debug("CONTROL PORT {} => {}".format(i, ports_info[i]))
 
     # Property parameters
-    i = len(ports_info)
+    # Number them after the last port index, as ports_info is indexed by port
+    # index: counting the control input ports would overwrite the ports with
+    # higher indexes whenever other ports (audio, atom...) come before them.
+    i = plugin.get_num_ports() - 1
     for control in world.find_nodes(plugin.get_uri(), world.ns.patch.writable, None):
         symbol = world.get_symbol(control)
         name = str(world.get(control, world.ns.rdfs.label, None))
@@ -1131,6 +1134,7 @@ def get_plugin_ports(plugin_url):
             is_path = False
             path_file_types = None
             path_preload = False
+            drawbar = None
 
             # Parameter Desgination => http://lv2plug.in/ns/lv2core#designation
             designation = str(world.get(control, world.ns.lv2.designation, None))
@@ -1232,6 +1236,7 @@ def get_plugin_ports(plugin_url):
             'path_preload': path_preload,
             'envelope': envelope,
             'filter': filter,
+            'drawbar': drawbar,
             'is_bypass': is_bypass,
             'bypass_value': bypass_value,
             'not_on_gui': not_on_gui,
