@@ -65,8 +65,12 @@ Keyboard
 Keyboard over the Pattern Editor (Note pressed in the step sequencer)
     The keyboard plays the edited pattern's chain and can record into it.
     Right column   1: play / stop the pattern.
-                   2: record, the editor's own record button (red, pulsing
-                      while armed).
+                   2: record, the editor's own record button (dim red,
+                      pulsing bright red while armed).
+                   8: tap to undo, long press to redo, as in the step
+                      sequencer: recordings made here can be taken back
+                      without leaving the keyboard. Lit only over the
+                      editor, where there is a pattern to undo.
     While playing, a recorded note goes in at the nearest step, as long as
     it was held, in whole steps. While stopped, notes are entered a step at
     a time at the playhead, as from a MIDI keyboard: a note adds a one-step
@@ -333,7 +337,9 @@ class COLORS:
     # Follow on/off: blue, like the playhead it follows.
     FOLLOW_ON = 45
     FOLLOW_OFF = 47
-    UNDO = 6
+    # Undo: purple, so it reads as its own function next to the blue follow
+    # button and the red record button.
+    UNDO = 49
     # The steps a long note runs through after its first. A dimmer, neutral
     # tone, so a note that spans several steps reads as one note rather than
     # several - and stays distinct from the velocity ramp, which is all green
@@ -369,6 +375,7 @@ class COLORS:
     KEYS_DRUMS_ON = 21
     KEYS_DRUMS_OFF = 2
     # Right column button 2 over the editor: record armed (pulsing) or not.
+    # Dim red when idle, full red while armed, so the pulsing is the change.
     RECORD = 7
     RECORD_ON = 5
 
@@ -636,6 +643,28 @@ def _shown_pattern_editor():
     except Exception as ex:
         logging.debug(f"Launchpad pattern editor unavailable: {ex}")
         return None
+
+
+def _undo_pattern(redo=False):
+    """Step the pattern editor's snapshot stack back (undo) or forward
+    (redo), so the pad and the screen share one history.
+
+    Both mode handlers can record into the edited pattern, so both undo
+    through here rather than keeping a history of their own. Returns True if
+    there was an editor to act on.
+    """
+    pe = _shown_pattern_editor()
+    if pe is None:
+        return False
+    try:
+        if redo:
+            pe.redo_pattern()
+        else:
+            pe.undo_pattern()
+    except Exception as ex:
+        logging.error(f"Launchpad could not {'redo' if redo else 'undo'}: {ex}")
+        return False
+    return True
 
 
 def _flag_pattern_changed():
@@ -1213,17 +1242,8 @@ class StepSeqHandler(ModeHandlerBase):
     def _undo(self, redo=False):
         """Undo or redo through the pattern editor's own snapshot stack, so
         the pad and the screen share one history."""
-        pe = self._pattern_editor()
-        if pe is None:
-            return
-        try:
-            if redo:
-                pe.redo_pattern()
-            else:
-                pe.undo_pattern()
-        except Exception as ex:
-            logging.error(f"Launchpad could not {'redo' if redo else 'undo'}: {ex}")
-        self._render_grid()
+        if _undo_pattern(redo):
+            self._render_grid()
 
     def _select_cell(self, step, index):
         """Move the cursor to a cell and show it on the touchscreen too."""
@@ -1600,6 +1620,10 @@ class KeysHandler(ModeHandlerBase):
         # What the play and record buttons show, read by the poll.
         self._playing = False
         self._recording = False
+        # Press time of the undo button, to tell undo (tap) from redo. The
+        # keyboard can record into the pattern, so it owns the same undo
+        # button as the step sequencer.
+        self._undo_pressed_at = None
         # The notes on the grid the edited pattern is playing at its
         # playhead, and the step they were read at (None to read again).
         self._echo = frozenset()
@@ -1620,6 +1644,7 @@ class KeysHandler(ModeHandlerBase):
         with self._lock:
             if active:
                 self._seq = seq
+                self._undo_pressed_at = None
                 super().set_active(True)
                 # The device was cleared by the driver, so forget what was lit.
                 self._leds.forget()
@@ -1943,6 +1968,16 @@ class KeysHandler(ModeHandlerBase):
         if ccnum == CC_SUSTAIN:
             self._sustain(ccval > 0)
             return
+        # Undo and redo act on release, where the press length is known, so
+        # this has to come before the press-only handling below.
+        if ccnum == CC_UNDO:
+            if ccval > 0:
+                self._undo_pressed_at = time.time()
+            elif self._undo_pressed_at is not None:
+                held = time.time() - self._undo_pressed_at
+                self._undo_pressed_at = None
+                self._undo(redo=held >= SS_LONG_PRESS_TIME)
+            return
         if ccval == 0:
             return
         if ccnum in (CC_KEYS_PLAY, CC_KEYS_RECORD):
@@ -1969,6 +2004,17 @@ class KeysHandler(ModeHandlerBase):
             self._shift(-1)
 
     # ----- over the Pattern Editor: playing and recording --------------------
+
+    def _undo(self, redo=False):
+        """Undo or redo what was recorded on the pads, through the pattern
+        editor's own snapshot stack."""
+        if not _undo_pattern(redo):
+            return
+        # The pattern changed under the pads: read the echo again, since the
+        # step may have lost or gained notes.
+        with self._lock:
+            self._update_echo(force=True)
+            self._render_grid()
 
     def _seq_playing(self):
         try:
@@ -2248,6 +2294,8 @@ class KeysHandler(ModeHandlerBase):
             elif ccnum == CC_KEYS_RECORD and self._seq is not None:
                 self._leds.cc_on(ccnum, COLORS.RECORD_ON if self._recording
                                  else COLORS.RECORD, 2 if self._recording else 0)
+            elif ccnum == CC_UNDO and self._seq is not None:
+                self._leds.cc_on(ccnum, COLORS.UNDO)
             elif ccnum == CC_SUSTAIN:
                 self._leds.cc_on(ccnum, COLORS.SUSTAIN_ON if self._sustain_chan is not None
                                  else COLORS.SUSTAIN)
